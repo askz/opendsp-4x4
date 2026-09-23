@@ -22,6 +22,7 @@ class MainActivity : Activity() {
     private lateinit var webView: WebView
     private lateinit var usb: UsbHid
     private lateinit var bridge: Bridge
+    private lateinit var files: FileBridge
     private var safeTopPx = 0f
     private var safeBottomPx = 0f
 
@@ -41,9 +42,11 @@ class MainActivity : Activity() {
             .addPathHandler("/assets/", WebViewAssetLoader.AssetsPathHandler(this))
             .build()
 
+        files = FileBridge(this)
         webView = WebView(this).apply {
             settings.javaScriptEnabled = true
-            settings.domStorageEnabled = true // localStorage for saved defaults
+            settings.domStorageEnabled = true
+            webChromeClient = files.chromeClient
             webViewClient = object : WebViewClient() {
                 override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? =
                     assetLoader.shouldInterceptRequest(request.url)
@@ -77,6 +80,7 @@ class MainActivity : Activity() {
         )
         bridge = Bridge(webView, usb)
         webView.addJavascriptInterface(bridge, "AndroidUsb")
+        webView.addJavascriptInterface(files, "AndroidFiles")
 
         webView.loadUrl("https://appassets.androidplatform.net/assets/www/index.html")
         maybeOpenOnAttach(intent)
@@ -85,6 +89,14 @@ class MainActivity : Activity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         maybeOpenOnAttach(intent)
+    }
+
+    @Deprecated("Activity result API of the platform Activity (no AndroidX activity dependency)")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (!files.onActivityResult(requestCode, resultCode, data)) {
+            @Suppress("DEPRECATION")
+            super.onActivityResult(requestCode, resultCode, data)
+        }
     }
 
     override fun onDestroy() {

@@ -28,7 +28,7 @@ const IN_NAMES = ["In A", "In B", "In C", "In D"];
 const OUT_NAMES = ["Out 1", "Out 2", "Out 3", "Out 4"];
 
 export function defaultBand(freqHz = 1000): PeqBand {
-  return { freqHz, gainDb: 0, bwOct: 1, type: PeqType.PEAK, bypass: true };
+  return { freqHz, gainDb: 0, bwOct: 1, type: PeqType.PEAK, bypass: false };
 }
 // Sensible per-band default centre frequencies (used for new channels + dbl-click reset).
 export const DEFAULT_BAND_FREQS = [60, 150, 400, 1000, 2500, 6000, 12000];

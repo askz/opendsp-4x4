@@ -1,95 +1,89 @@
-// WebHID transport for desktop Chrome/Edge. The device is a no-report-ID HID
-// with 64-byte interrupt in/out, so we use sendReport(0, ...) and the
-// `inputreport` event. (WebHID is desktop-only; Android needs the native build.)
-import type { DspTransport } from "./transport.ts";
+// WebHID link for desktop Chrome/Edge. The device is a no-report-ID HID with
+// 64-byte interrupt in/out, so reports go out via sendReport(0, …) and come back
+// through the `inputreport` event. (WebHID is desktop-only; Android uses native.ts.)
+import type { HidLink } from "./link.ts";
 
 export const VENDOR_ID = 0x0168;
 export const PRODUCT_ID = 0x0821;
-const REPORT_ID = 0; // device uses no report IDs
+const REPORT_ID = 0;
 
-export class WebHidTransport implements DspTransport {
-  private listeners = new Set<(r: Uint8Array) => void>();
-  private pending: ((r: Uint8Array | null) => void) | null = null;
-  private chain: Promise<unknown> = Promise.resolve();
+const isDsp = (device: HIDDevice) => device.vendorId === VENDOR_ID && device.productId === PRODUCT_ID;
+
+export class WebHidLink implements HidLink {
+  private readonly device: HIDDevice;
+  private readonly reportListeners = new Set<(report: Uint8Array) => void>();
+  private readonly disconnectListeners = new Set<() => void>();
 
   static supported(): boolean {
     return typeof navigator !== "undefined" && "hid" in navigator;
   }
 
-  /** Prompt the user to pick the DSP. MUST be called from a user gesture (click). */
-  static async request(): Promise<WebHidTransport | null> {
-    if (!WebHidTransport.supported())
-      throw new Error("WebHID unavailable — use Chrome/Edge on desktop (not Firefox/Safari/Android).");
-    const devices = await navigator.hid.requestDevice({
-      filters: [{ vendorId: VENDOR_ID, productId: PRODUCT_ID }],
-    });
-    const dev = devices[0];
-    return dev ? new WebHidTransport(dev) : null;
+  /** Prompt the user to pick the DSP. Must be called from a user gesture. */
+  static async request(): Promise<WebHidLink | null> {
+    if (!WebHidLink.supported()) throw new Error("WebHID is unavailable: use Chrome or Edge on desktop.");
+    const [device] = await navigator.hid.requestDevice({ filters: [{ vendorId: VENDOR_ID, productId: PRODUCT_ID }] });
+    return device ? new WebHidLink(device) : null;
   }
 
-  /** Reconnect to an already-granted device without prompting (e.g. on page load). */
-  static async existing(): Promise<WebHidTransport | null> {
-    if (!WebHidTransport.supported()) return null;
-    const dev = (await navigator.hid.getDevices())
-      .find((d) => d.vendorId === VENDOR_ID && d.productId === PRODUCT_ID);
-    return dev ? new WebHidTransport(dev) : null;
+  /** An already-granted DSP, without prompting. */
+  static async existing(): Promise<WebHidLink | null> {
+    if (!WebHidLink.supported()) return null;
+    const device = (await navigator.hid.getDevices()).find(isDsp);
+    return device ? new WebHidLink(device) : null;
   }
 
-  private constructor(private readonly device: HIDDevice) {}
+  /** Notify when an already-granted DSP is plugged in. Returns an unsubscribe function. */
+  static onAttach(listener: (link: WebHidLink) => void): () => void {
+    if (!WebHidLink.supported()) return () => {};
+    const handler = (event: HIDConnectionEvent) => {
+      if (isDsp(event.device)) listener(new WebHidLink(event.device));
+    };
+    navigator.hid.addEventListener("connect", handler);
+    return () => navigator.hid.removeEventListener("connect", handler);
+  }
 
-  get isOpen(): boolean { return this.device.opened; }
-  get productName(): string { return this.device.productName || "DSP 4x4 Mini Pro"; }
+  private constructor(device: HIDDevice) {
+    this.device = device;
+  }
+
+  get productName(): string {
+    return this.device.productName || "DSP 4x4 Mini Pro";
+  }
 
   async open(): Promise<void> {
     if (!this.device.opened) await this.device.open();
     this.device.addEventListener("inputreport", this.handleReport);
+    navigator.hid.addEventListener("disconnect", this.handleDisconnect);
   }
 
   async close(): Promise<void> {
     this.device.removeEventListener("inputreport", this.handleReport);
-    if (this.device.opened) await this.device.close();
+    navigator.hid.removeEventListener("disconnect", this.handleDisconnect);
+    if (this.device.opened) await this.device.close().catch(() => undefined);
   }
 
-  private handleReport = (e: HIDInputReportEvent): void => {
-    const bytes = new Uint8Array(e.data.buffer, e.data.byteOffset, e.data.byteLength);
-    if (this.pending) {
-      const resolve = this.pending;
-      this.pending = null;
-      resolve(bytes);
-    }
-    for (const cb of this.listeners) cb(bytes);
+  async write(report: Uint8Array): Promise<void> {
+    await this.device.sendReport(REPORT_ID, report as BufferSource);
+  }
+
+  onReport(listener: (report: Uint8Array) => void): () => void {
+    this.reportListeners.add(listener);
+    return () => this.reportListeners.delete(listener);
+  }
+
+  onDisconnect(listener: () => void): () => void {
+    this.disconnectListeners.add(listener);
+    return () => this.disconnectListeners.delete(listener);
+  }
+
+  private readonly handleReport = (event: HIDInputReportEvent): void => {
+    const view = event.data;
+    const report = new Uint8Array(view.buffer.slice(view.byteOffset, view.byteOffset + view.byteLength));
+    for (const listener of this.reportListeners) listener(report);
   };
 
-  onReport(cb: (r: Uint8Array) => void): () => void {
-    this.listeners.add(cb);
-    return () => this.listeners.delete(cb);
-  }
-
-  // Serialize requests: each awaits the previous, so a debounced burst can't race
-  // the single-pending reply slot (the transport handles one in-flight at a time).
-  async request(frame: Uint8Array, timeoutMs = 1200): Promise<Uint8Array> {
-    const run = this.chain.then(() => this.sendOne(frame, timeoutMs));
-    this.chain = run.then(() => undefined, () => undefined);
-    return run;
-  }
-
-  private async sendOne(frame: Uint8Array, timeoutMs: number): Promise<Uint8Array> {
-    if (!this.device.opened) throw new Error("device not open");
-    // The device drops the reply to the first transaction after open, so retry
-    // a few times with a short per-attempt timeout (matches the editor's behaviour).
-    const perMs = 400;
-    for (let i = 0; i * perMs < timeoutMs; i++) {
-      const reply = new Promise<Uint8Array | null>((resolve) => {
-        this.pending = resolve;
-        setTimeout(() => { if (this.pending === resolve) { this.pending = null; resolve(null); } }, perMs);
-        // cast: TS 5.7 types Uint8Array<ArrayBufferLike>; sendReport wants BufferSource
-        void this.device.sendReport(REPORT_ID, frame as BufferSource).catch(() => {
-          if (this.pending === resolve) { this.pending = null; resolve(null); }
-        });
-      });
-      const r = await reply;
-      if (r) return r;
-    }
-    throw new Error("reply timeout");
-  }
+  private readonly handleDisconnect = (event: HIDConnectionEvent): void => {
+    if (event.device !== this.device) return;
+    for (const listener of this.disconnectListeners) listener();
+  };
 }

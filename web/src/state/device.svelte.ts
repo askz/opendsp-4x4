@@ -1,159 +1,190 @@
-// Reactive device state + controller. UI mutates this (instant), and each change
-// is debounced + sent through the (serialized) transport. Engineering-unit params
-// are converted to wire values via the Calibration seam.
-import { WebHidTransport } from "../transport/webhid.ts";
-import { NativeTransport } from "../transport/native.ts";
-import { Dsp } from "../dsp.ts";
+// Reactive device model + controller. The UI mutates the model (instant feedback)
+// and each change is sent through the Connection's request channel, where queued
+// writes to the same parameter coalesce, so no UI-side debouncing is needed.
+// Engineering-unit params are converted to wire values via the Calibration seam.
+import { Connection, type ConnectionPhase, type SyncReason } from "./connection.ts";
+import { platformLinkProvider } from "../transport/platform.ts";
+import { ProtocolError, emptyStats, type ChannelStats } from "../transport/channel.ts";
+import type { Dsp, DeviceInfo } from "../dsp.ts";
 import { defaultCalibration, type Calibration } from "../eq/calibration.ts";
-import { getLevelsFrame, gainRawToDb } from "../protocol/control.ts";
+import { gainRawToDb } from "../protocol/control.ts";
 import { thresholdRawToDb, samplesToMs, rawToQ, peqIndexToHz } from "../protocol/blocks.ts";
-import { levelsFromReply, reconstructPresetImage, parsePresetImage } from "../protocol/readback.ts";
+import type { PresetReadback } from "../protocol/readback.ts";
 import { makeChannels, OUT_BASE, DEFAULT_BAND_FREQS, type Channel } from "./model.ts";
 import type { ChannelEq } from "../eq/types.ts";
 
 const DEFAULTS_KEY = "opendsp-defaults";
+const METER_INTERVAL_MS = 100;
+const MAX_ISSUES = 50;
+
+export interface Issue {
+  at: number;
+  message: string;
+}
+
+const messageOf = (error: unknown) => (error instanceof Error ? error.message : String(error));
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export class DeviceStore {
-  connected = $state(false);
+  phase = $state<ConnectionPhase>("idle");
+  connectionError = $state("");
+  info = $state<DeviceInfo | null>(null);
   productName = $state("");
-  version = $state("");
-  error = $state("");
+  stats = $state<ChannelStats>(emptyStats());
+  /** Label of the long-running device operation in progress (recall/store), or "". */
+  busy = $state("");
+  issues = $state<Issue[]>([]);
+
   presetName = $state("");
-  activePreset = $state(-1); // last-recalled preset slot (highlights its pad); -1 = unknown on connect
+  presetNames = $state<string[]>([]);
+  activePreset = $state(-1);
   hasDefaults = $state(typeof localStorage !== "undefined" && localStorage.getItem(DEFAULTS_KEY) !== null);
   channels = $state<Channel[]>(makeChannels());
   routing = $state<number[]>([0x01, 0x02, 0x04, 0x08]); // Out1..4 input masks (default diagonal)
   selected = $state(-1); // selected channel index; -1 = nothing open (collapsed overview on load)
   eqLink = $state<Record<number, number>>({}); // output index -> linked partner (symmetric); EQ edits mirror
 
-  private dsp: Dsp | null = null;
-  private cal: Calibration = defaultCalibration;
-  private timers = new Map<string, ReturnType<typeof setTimeout>>();
-  private meterTimer?: ReturnType<typeof setInterval>;
+  readonly connection: Connection;
+  private readonly cal: Calibration = defaultCalibration;
+  private meterRun = 0;
 
-  lastReadback: ReturnType<typeof parsePresetImage> | null = null; // raw readback (debug/calibration)
+  constructor() {
+    this.connection = new Connection(platformLinkProvider(), {
+      sync: (dsp, reason) => this.hydrate(dsp, reason),
+      started: (dsp) => this.startMeters(dsp),
+      ended: () => this.stopMeters(),
+    });
+    this.connection.onChange((snapshot) => {
+      this.phase = snapshot.phase;
+      this.connectionError = snapshot.error;
+      this.info = snapshot.info;
+      this.productName = snapshot.productName;
+      this.stats = snapshot.stats;
+    });
+    this.phase = this.connection.snapshot.phase;
+  }
 
+  get connected(): boolean { return this.phase === "ready"; }
+  get supported(): boolean { return this.phase !== "unsupported"; }
+  get lastIssue(): Issue | undefined { return this.issues[this.issues.length - 1]; }
   get selectedChannel(): Channel | undefined { return this.channels[this.selected]; }
   ch(index: number): Channel { return this.channels[index]!; }
   /** Collapse the open node → all-collapsed patch-board overview. */
   collapse(): void { this.selected = -1; }
 
-  /** Connect via the device picker (needs a user gesture). On Android the native
-   *  bridge replaces the picker — open() raises the system USB-permission dialog. */
-  async connect(): Promise<void> {
-    try { await this._bind(NativeTransport.supported() ? new NativeTransport() : await WebHidTransport.request()); }
-    catch (e) { this.error = (e as Error).message; }
+  connect(): Promise<void> { return this.connection.connect(); }
+  autoConnect(): Promise<void> { return this.connection.autoConnect(); }
+  disconnect(): Promise<void> { return this.connection.disconnect(); }
+  clearIssues(): void { this.issues = []; }
+
+  // --- readback ---
+
+  private async hydrate(dsp: Dsp, reason: SyncReason): Promise<void> {
+    const image = await dsp.presetImage();
+    const activePreset = await dsp.activePreset();
+    const presetNames = reason === "connect" ? await dsp.presetNames() : this.presetNames;
+    this.applyImage(image);
+    this.activePreset = activePreset;
+    this.presetNames = presetNames;
   }
 
-  /** Reconnect to an already-granted device without prompting (call on page load). */
-  async autoConnect(): Promise<void> {
-    try {
-      if (NativeTransport.supported()) {
-        if (NativeTransport.connected()) await this._bind(new NativeTransport()); // attach intent pre-grants permission
-        return;
-      }
-      await this._bind(await WebHidTransport.existing());
-    } catch (e) { this.error = (e as Error).message; }
-  }
-
-  private async _bind(t: WebHidTransport | NativeTransport | null): Promise<void> {
-    if (!t) return;
-    await t.open();
-    this.dsp = new Dsp(t);
-    this.version = await this.dsp.getVersion(); // self-wakes (0x10 then 0x13)
-    this.productName = t.productName;
-    this.connected = true;
-    this.error = "";
-    try { await this.hydrate(); } catch { /* readback is best-effort; UI keeps defaults */ }
-    this.startMeters();
-  }
-
-  /** Read the 9 channel-state pages on connect → mirror preset name, channel names, gains. */
-  private async hydrate(): Promise<void> {
-    if (!this.dsp) return;
-    const pages: Uint8Array[] = [];
-    for (let i = 0; i < 9; i++) {
-      const data = await this.dsp.channelState(i); // [idx, ...50B]
-      pages[data[0] ?? i] = data.slice(1, 51);
-    }
-    const pr = parsePresetImage(reconstructPresetImage(pages));
-    this.lastReadback = pr; // raw readback kept for calibration/debug (no extra device I/O)
-    this.presetName = pr.presetName;
-    pr.inputs.forEach((c, i) => {
+  /** Mirror a decoded preset image into the model. Mute and PEQ bypass have no readback. */
+  private applyImage(image: PresetReadback): void {
+    this.presetName = image.presetName;
+    image.inputs.forEach((record, i) => {
       const ch = this.ch(i);
-      if (c.name) ch.name = c.name;
-      ch.gainDb = gainRawToDb(c.gainRaw);
-      ch.polarity = c.polarity;
-      ch.gate = { attackMs: c.gate.atkRaw, releaseMs: c.gate.relRaw, holdMs: c.gate.holdRaw, thresholdDb: thresholdRawToDb(c.gate.thrRaw) };
+      if (record.name) ch.name = record.name;
+      ch.gainDb = gainRawToDb(record.gainRaw);
+      ch.polarity = record.polarity;
+      ch.gate = {
+        attackMs: record.gate.atkRaw, releaseMs: record.gate.relRaw, holdMs: record.gate.holdRaw,
+        thresholdDb: thresholdRawToDb(record.gate.thrRaw),
+      };
     });
-    pr.outputs.forEach((c, i) => {
+    image.outputs.forEach((record, i) => {
       const ch = this.ch(OUT_BASE + i);
-      if (c.name) ch.name = c.name;
-      ch.gainDb = gainRawToDb(c.gainRaw);
-      ch.polarity = c.polarity;
-      ch.delayMs = samplesToMs(c.delaySamples);
-      this.routing[i] = c.routingMask; // mirror the device's real input→output routing
+      if (record.name) ch.name = record.name;
+      ch.gainDb = gainRawToDb(record.gainRaw);
+      ch.polarity = record.polarity;
+      ch.delayMs = samplesToMs(record.delaySamples);
+      this.routing[i] = record.routingMask;
       ch.comp = {
-        ratioIndex: c.comp.ratioIndex, kneeDb: c.comp.kneeRaw,
-        attackMs: c.comp.atkRaw, releaseMs: c.comp.relRaw, thresholdDb: thresholdRawToDb(c.comp.thrRaw),
+        ratioIndex: record.comp.ratioIndex, kneeDb: record.comp.kneeRaw,
+        attackMs: record.comp.atkRaw, releaseMs: record.comp.relRaw, thresholdDb: thresholdRawToDb(record.comp.thrRaw),
       };
       if (ch.eq) {
-        ch.eq.hpf = { freqHz: this.cal.xoverRawToHz(c.hpfRaw), slope: c.hpfSlope };
-        ch.eq.lpf = { freqHz: this.cal.xoverRawToHz(c.lpfRaw), slope: c.lpfSlope };
-        ch.eq.bands = c.bands.map((bd) => {
-          const freqHz = peqIndexToHz(bd.freqIdx);
+        ch.eq.hpf = { freqHz: this.cal.xoverRawToHz(record.hpfRaw), slope: record.hpfSlope };
+        ch.eq.lpf = { freqHz: this.cal.xoverRawToHz(record.lpfRaw), slope: record.lpfSlope };
+        ch.eq.bands = record.bands.map((band) => {
+          const freqHz = peqIndexToHz(band.freqIdx);
           return {
-            freqHz, type: bd.type, bypass: false,
-            gainDb: this.cal.peqGainRawToDb(bd.gainRaw, bd.type),
-            bwOct: this.cal.qToBwOct(rawToQ(bd.qRaw), freqHz),
+            freqHz, type: band.type, bypass: false,
+            gainDb: this.cal.peqGainRawToDb(band.gainRaw, band.type),
+            bwOct: this.cal.qToBwOct(rawToQ(band.qRaw), freqHz),
           };
         });
       }
     });
   }
 
-  /** DEBUG: dump the live channel-state records as hex (full records, to diff Out1 vs Out2). */
-  async _dumpRecords(): Promise<Record<string, string>> {
-    if (!this.dsp) return {};
-    const pages: Uint8Array[] = [];
-    for (let i = 0; i < 9; i++) { const d = await this.dsp.channelState(i); pages[d[0] ?? i] = d.slice(1, 51); }
-    const img = reconstructPresetImage(pages);
-    const hex = (o: number, n: number) => Array.from(img.slice(o, o + n), (b) => b.toString(16).padStart(2, "0")).join(" ");
-    const out: Record<string, string> = {};
-    [112, 186, 260, 334].forEach((b, i) => { const h = hex(b, 74); out[`OUT${i + 1}`] = h; console.log(`OUT${i + 1} @${b}: ${h}`); });
-    [16, 40, 64, 88].forEach((b, i) => { const h = hex(b, 24); out[`IN${"ABCD"[i]}`] = h; console.log(`IN${"ABCD"[i]} @${b}: ${h}`); });
-    return out;
+  // --- meters ---
+
+  private startMeters(dsp: Dsp): void {
+    const run = ++this.meterRun;
+    void this.meterLoop(dsp, run);
   }
 
-  /** Poll the device's 8 I/O levels (~10 Hz) into channel meters. */
-  private startMeters(): void {
-    this.stopMeters();
-    let busy = false; // skip a tick if the previous poll hasn't replied — avoids piling up the transport
-    this.meterTimer = setInterval(() => {
-      if (!this.dsp || busy) return;
-      busy = true;
-      void this.dsp.send(getLevelsFrame()).then((r) => {
-        const lv = levelsFromReply(r);
-        if (lv) for (let i = 0; i < 8; i++) this.ch(i).meter = lv[i]!;
-      }).catch(() => {}).finally(() => { busy = false; });
-    }, 100);
+  private stopMeters(): void {
+    this.meterRun++;
+    for (const ch of this.channels) ch.meter = 0;
   }
-  private stopMeters(): void { if (this.meterTimer) { clearInterval(this.meterTimer); this.meterTimer = undefined; } }
 
-  /** Debounce by key; coalesces rapid changes (e.g. a fader/EQ drag) into one send. */
-  private commit(key: string, fn: () => void, delay = 40): void {
-    const prev = this.timers.get(key);
-    if (prev) clearTimeout(prev);
-    this.timers.set(key, setTimeout(() => {
-      this.timers.delete(key);
-      if (this.dsp) void Promise.resolve().then(fn).catch(() => {});
-    }, delay));
+  /** Poll the 8 I/O levels at ~10 Hz on the background lane (user writes always go first). */
+  private async meterLoop(dsp: Dsp, run: number): Promise<void> {
+    while (run === this.meterRun) {
+      const started = performance.now();
+      try {
+        const levels = await dsp.levels();
+        if (levels && run === this.meterRun) levels.forEach((level, i) => { this.ch(i).meter = level; });
+      } catch {
+        // failures are counted by the Connection's transaction monitor
+      }
+      await sleep(Math.max(0, METER_INTERVAL_MS - (performance.now() - started)));
+    }
+  }
+
+  // --- issue log ---
+
+  private report(label: string, error: unknown): void {
+    if (error instanceof ProtocolError && error.kind === "closed") return; // the Connection reports the loss
+    const issue = { at: Date.now(), message: `${label}: ${messageOf(error)}` };
+    this.issues = [...this.issues.slice(-(MAX_ISSUES - 1)), issue];
+  }
+
+  /** Fire-and-forget a device write; failures land in the issue log. */
+  private send(label: string, op: (dsp: Dsp) => Promise<unknown>): void {
+    const dsp = this.connection.dsp;
+    if (!dsp) return;
+    op(dsp).catch((error: unknown) => this.report(label, error));
+  }
+
+  private async runBusy(label: string, op: (dsp: Dsp) => Promise<void>): Promise<void> {
+    const dsp = this.connection.dsp;
+    if (!dsp || this.busy) return;
+    this.busy = label;
+    try {
+      await op(dsp);
+    } catch (error) {
+      this.report(label, error);
+    } finally {
+      this.busy = "";
+    }
   }
 
   // --- channel basics ---
-  setGainDb(i: number, db: number): void { this.ch(i).gainDb = db; this.commit(`gain${i}`, () => this.dsp!.setLevelDb(i, db)); }
-  setMute(i: number, on: boolean): void { this.ch(i).mute = on; this.commit(`mute${i}`, () => this.dsp!.mute(i, on), 0); }
-  setPolarity(i: number, inv: boolean): void { this.ch(i).polarity = inv; this.commit(`pol${i}`, () => this.dsp!.setPolarity(i, inv), 0); }
+  setGainDb(i: number, db: number): void { this.ch(i).gainDb = db; this.send(`${this.ch(i).name} gain`, (d) => d.setLevelDb(i, db)); }
+  setMute(i: number, on: boolean): void { this.ch(i).mute = on; this.send(`${this.ch(i).name} mute`, (d) => d.mute(i, on)); }
+  setPolarity(i: number, inv: boolean): void { this.ch(i).polarity = inv; this.send(`${this.ch(i).name} polarity`, (d) => d.setPolarity(i, inv)); }
 
   // --- EQ (commit reads the already-mutated band; UI mutates eq directly for instant draw) ---
   commitPeqBand(i: number, band: number): void {
@@ -166,15 +197,24 @@ export class DeviceStore {
   }
   private sendPeqBand(i: number, band: number): void {
     const b = this.ch(i).eq!.bands[band]!;
-    this.commit(`peq${i}.${band}`, () => this.dsp!.peqBand(i, band, {
+    const params = {
       freqHz: b.freqHz, q: this.cal.bwOctToQ(b.bwOct, b.freqHz),
       gainRaw: this.cal.peqGainDbToRaw(b.gainDb, b.type), type: b.type, bypass: b.bypass,
-    }));
+    };
+    this.send(`${this.ch(i).name} PEQ band ${band + 1}`, (d) => d.peqBand(i, band, params));
   }
   commitHpf(i: number): void { this.sendHpf(i); const p = this.eqLink[i]; if (p !== undefined && this.ch(p).eq) { this.ch(p).eq!.hpf = { ...$state.snapshot(this.ch(i).eq!.hpf) }; this.sendHpf(p); } }
   commitLpf(i: number): void { this.sendLpf(i); const p = this.eqLink[i]; if (p !== undefined && this.ch(p).eq) { this.ch(p).eq!.lpf = { ...$state.snapshot(this.ch(i).eq!.lpf) }; this.sendLpf(p); } }
-  private sendHpf(i: number): void { const x = this.ch(i).eq!.hpf; this.commit(`hpf${i}`, () => this.dsp!.crossoverHpf(i, this.cal.xoverHzToRaw(x.freqHz), x.slope)); }
-  private sendLpf(i: number): void { const x = this.ch(i).eq!.lpf; this.commit(`lpf${i}`, () => this.dsp!.crossoverLpf(i, this.cal.xoverHzToRaw(x.freqHz), x.slope)); }
+  private sendHpf(i: number): void {
+    const { freqHz, slope } = this.ch(i).eq!.hpf;
+    const raw = this.cal.xoverHzToRaw(freqHz);
+    this.send(`${this.ch(i).name} high-pass`, (d) => d.crossoverHpf(i, raw, slope));
+  }
+  private sendLpf(i: number): void {
+    const { freqHz, slope } = this.ch(i).eq!.lpf;
+    const raw = this.cal.xoverHzToRaw(freqHz);
+    this.send(`${this.ch(i).name} low-pass`, (d) => d.crossoverLpf(i, raw, slope));
+  }
 
   /** Reset one PEQ band to its default (centre freq, 0 dB, 1 oct, peak). */
   resetBand(i: number, band: number): void {
@@ -205,62 +245,85 @@ export class DeviceStore {
   }
 
   // --- dynamics / delay / routing ---
-  setDelayMs(i: number, ms: number): void { this.ch(i).delayMs = ms; this.commit(`delay${i}`, () => this.dsp!.delayMs(i, ms)); }
-  commitComp(i: number): void { const c = this.ch(i).comp!; this.commit(`comp${i}`, () => this.dsp!.compressor(i, c)); }
-  commitGate(i: number): void { const g = this.ch(i).gate!; this.commit(`gate${i}`, () => this.dsp!.gate(i, g)); }
-  setRouting(outIndex: number, mask: number): void { this.routing[outIndex - 0x04] = mask; this.commit(`route${outIndex}`, () => this.dsp!.routing(outIndex, mask), 0); }
+  setDelayMs(i: number, ms: number): void { this.ch(i).delayMs = ms; this.send(`${this.ch(i).name} delay`, (d) => d.delayMs(i, ms)); }
+  commitComp(i: number): void { const c = { ...this.ch(i).comp! }; this.send(`${this.ch(i).name} compressor`, (d) => d.compressor(i, c)); }
+  commitGate(i: number): void { const g = { ...this.ch(i).gate! }; this.send(`${this.ch(i).name} gate`, (d) => d.gate(i, g)); }
+  setRouting(outIndex: number, mask: number): void {
+    this.routing[outIndex - OUT_BASE] = mask;
+    this.send(`${this.ch(outIndex).name} routing`, (d) => d.routing(outIndex, mask));
+  }
 
-  // --- global ---
-  recallPreset(slot: number): void { if (this.dsp) { this.activePreset = slot; void this.dsp.recallPreset(slot); } }
-  storePreset(slot: number): void { if (this.dsp) void this.dsp.storePreset(slot); }
-  testTone(source: number, freqIndex = 0): void { if (this.dsp) void this.dsp.testTone(source, freqIndex); }
-  setPassword(pw: string): void { if (this.dsp) void this.dsp.setPassword(pw); }
+  // --- presets / global ---
+
+  /** Recall a preset slot, then re-read the device so the UI shows what is actually loaded. */
+  recallPreset(slot: number): Promise<void> {
+    return this.runBusy(`Recall preset ${slot + 1}`, async (dsp) => {
+      await dsp.recallPreset(slot);
+      await this.connection.resync();
+    });
+  }
+
+  /** Store the live state into a preset slot, then refresh that slot's name and the active slot. */
+  storePreset(slot: number): Promise<void> {
+    return this.runBusy(`Store preset ${slot + 1}`, async (dsp) => {
+      await dsp.storePreset(slot);
+      const name = await dsp.presetName(slot);
+      this.presetNames = this.presetNames.map((existing, i) => (i === slot ? name : existing));
+      this.activePreset = await dsp.activePreset();
+    });
+  }
+
+  testTone(source: number, freqIndex = 0): void { this.send("Test tone", (d) => d.testTone(source, freqIndex)); }
+  setPassword(pw: string): void { this.send("Lock password", (d) => d.setPassword(pw)); }
 
   // --- defaults snapshot (browser localStorage; not a device preset slot) ---
   saveDefaults(): void {
     try {
       localStorage.setItem(DEFAULTS_KEY, JSON.stringify({ channels: this.channels, routing: this.routing }));
       this.hasDefaults = true;
-    } catch { /* storage unavailable */ }
+    } catch (error) {
+      this.report("Save defaults", error);
+    }
   }
   async restoreDefaults(): Promise<void> {
-    let raw: string | null = null;
-    try { raw = localStorage.getItem(DEFAULTS_KEY); } catch { /* ignore */ }
-    if (!raw) return;
-    const snap = JSON.parse(raw) as { channels: Channel[]; routing: number[] };
-    this.channels = snap.channels;
-    this.routing = snap.routing;
+    let snapshot: { channels: Channel[]; routing: number[] };
+    try {
+      snapshot = JSON.parse(localStorage.getItem(DEFAULTS_KEY) ?? "null");
+      if (!Array.isArray(snapshot?.channels) || snapshot.channels.length !== 8
+        || !Array.isArray(snapshot.routing) || snapshot.routing.length !== 4) throw new Error("saved snapshot is malformed");
+    } catch (error) {
+      this.report("Restore defaults", error);
+      return;
+    }
+    this.channels = snapshot.channels.map((ch) => ({ ...ch, meter: 0 }));
+    this.routing = snapshot.routing;
     await this.pushAll();
   }
-  /** Re-send every channel's full state to the device (Restore Defaults). Meters paused to avoid contention. */
+  /** Re-send every channel's full state to the device (Restore Defaults). */
   async pushAll(): Promise<void> {
-    if (!this.dsp) return;
-    this.stopMeters();
-    try {
+    await this.runBusy("Restore defaults", async (dsp) => {
       for (let i = 0; i < this.channels.length; i++) {
         const ch = this.channels[i]!;
-        await this.dsp.setLevelDb(i, ch.gainDb);
-        await this.dsp.setPolarity(i, ch.polarity);
-        await this.dsp.mute(i, ch.mute);
-        if (ch.gate) await this.dsp.gate(i, ch.gate);
-        if (ch.isOutput) {
-          if (ch.delayMs != null) await this.dsp.delayMs(i, ch.delayMs);
-          if (ch.comp) await this.dsp.compressor(i, ch.comp);
-          await this.dsp.routing(i, this.routing[i - OUT_BASE] ?? 0);
-          if (ch.eq) {
-            await this.dsp.crossoverHpf(i, this.cal.xoverHzToRaw(ch.eq.hpf.freqHz), ch.eq.hpf.slope);
-            await this.dsp.crossoverLpf(i, this.cal.xoverHzToRaw(ch.eq.lpf.freqHz), ch.eq.lpf.slope);
-            for (let band = 0; band < ch.eq.bands.length; band++) {
-              const b = ch.eq.bands[band]!;
-              await this.dsp.peqBand(i, band, {
-                freqHz: b.freqHz, q: this.cal.bwOctToQ(b.bwOct, b.freqHz),
-                gainRaw: this.cal.peqGainDbToRaw(b.gainDb, b.type), type: b.type, bypass: b.bypass,
-              });
-            }
-          }
+        await dsp.setLevelDb(i, ch.gainDb);
+        await dsp.setPolarity(i, ch.polarity);
+        await dsp.mute(i, ch.mute);
+        if (ch.gate) await dsp.gate(i, ch.gate);
+        if (!ch.isOutput) continue;
+        if (ch.delayMs != null) await dsp.delayMs(i, ch.delayMs);
+        if (ch.comp) await dsp.compressor(i, ch.comp);
+        await dsp.routing(i, this.routing[i - OUT_BASE] ?? 0);
+        if (!ch.eq) continue;
+        await dsp.crossoverHpf(i, this.cal.xoverHzToRaw(ch.eq.hpf.freqHz), ch.eq.hpf.slope);
+        await dsp.crossoverLpf(i, this.cal.xoverHzToRaw(ch.eq.lpf.freqHz), ch.eq.lpf.slope);
+        for (let band = 0; band < ch.eq.bands.length; band++) {
+          const b = ch.eq.bands[band]!;
+          await dsp.peqBand(i, band, {
+            freqHz: b.freqHz, q: this.cal.bwOctToQ(b.bwOct, b.freqHz),
+            gainRaw: this.cal.peqGainDbToRaw(b.gainDb, b.type), type: b.type, bypass: b.bypass,
+          });
         }
       }
-    } finally { this.startMeters(); }
+    });
   }
 }
 

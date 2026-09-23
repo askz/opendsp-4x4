@@ -20,46 +20,47 @@ lines of TypeScript.
 ## The one seam that makes this cheap
 
 The codebase keeps a single boundary between the platform-agnostic protocol and the actual I/O,
-in [`web/src/transport/transport.ts`](web/src/transport/transport.ts):
+in [`web/src/transport/link.ts`](web/src/transport/link.ts): a raw HID byte pipe.
 
 ```ts
-interface DspTransport {
-  readonly isOpen: boolean;
+interface HidLink {
+  readonly productName: string;
   open(): Promise<void>;
   close(): Promise<void>;
-  request(frame: Uint8Array, timeoutMs?: number): Promise<Uint8Array>; // → next reply report
-  onReport(cb: (report: Uint8Array) => void): () => void;
+  write(report: Uint8Array): Promise<void>;            // one 64-byte output report
+  onReport(listener: (report: Uint8Array) => void): () => void;
+  onDisconnect(listener: () => void): () => void;       // unplugged / permission revoked
 }
 ```
 
-`webhid.ts` implements it for the desktop. For Android we add **one more implementation** that
-sends the same bytes through a bridge. Nothing above the seam changes.
+`webhid.ts` implements it for the desktop. For Android there is **one more implementation** that
+moves the same bytes through a bridge. Everything above the seam (request/reply matching,
+retries, queueing, the connection lifecycle) is shared and unit-tested.
 
 ```
-     Svelte UI ─ device store ─ Dsp client ─ DspTransport
-                                                 │
-                   ┌─────────────────────────────┴──────────────────────────┐
-              WebHidTransport (desktop)                    NativeTransport (Android)
-              device.sendReport / inputreport         window.AndroidUsb  ⇄  Kotlin USB
+     Svelte UI ─ device store ─ Connection ─ Dsp client ─ RequestChannel ─ HidLink
+                                                                              │
+                         ┌────────────────────────────────────────────────────┴──────┐
+                  WebHidLink (desktop)                                   NativeLink (Android)
+                  device.sendReport / inputreport              window.AndroidUsb  ⇄  Kotlin USB
 ```
 
-## Step 1 — `NativeTransport` (TypeScript)
+## Step 1 — `NativeLink` (TypeScript)
 
-[`web/src/transport/native.ts`](web/src/transport/native.ts) is the webhid request/retry chain
-with two lines swapped:
+[`web/src/transport/native.ts`](web/src/transport/native.ts) is the WebHID link with the I/O swapped:
 
-- **write:** `device.sendReport(0, frame)` → `window.AndroidUsb.write(base64)`
+- **write:** `device.sendReport(0, frame)` → `window.AndroidUsb.write(base64)` (returns `false` if the transfer failed)
 - **read:** the `inputreport` event → a global callback `window.__dsp_onReport(base64)`
+- **disconnect / attach:** `window.__dsp_onState(false / true)`
 
-The tricky bit — one in-flight request at a time, plus a ~400 ms-per-attempt retry because the
-device drops the reply to the *first* transaction after open — stays in JS so it's
-unit-testable. [`web/test/native.test.ts`](web/test/native.test.ts) drives it against a fake
-bridge (reply pairing, retry, timeout).
+The tricky bits (one transaction in flight, reply matching, per-command timeouts, retries) live
+in [`channel.ts`](web/src/transport/channel.ts), shared by both platforms.
+[`web/test/native.test.ts`](web/test/native.test.ts) drives the link against a fake bridge.
 
 Two more small edits wire it up:
 
-- [`device.svelte.ts`](web/src/state/device.svelte.ts) picks the transport — native bridge
-  present → `NativeTransport`, else `WebHidTransport`.
+- [`platform.ts`](web/src/transport/platform.ts) picks the link: native bridge present →
+  `NativeLink`, else `WebHidLink`.
 - [`vite.config.ts`](web/vite.config.ts) — `VITE_TARGET=android` sets `base: "./"` so the
   bundle's asset paths resolve under the WebView's asset-loader host.
 
@@ -71,8 +72,8 @@ Raw bytes only, carried as base64 strings.
 `AndroidUsb.open()`, `AndroidUsb.write(b64)`, `AndroidUsb.close()`, `AndroidUsb.isConnected()`.
 
 **native → JS** (`evaluateJavascript` on the UI thread):
-`window.__dsp_onReport(b64)` per inbound report; `window.__dsp_onState(connected)` on
-connect/drop.
+`window.__dsp_onReport(b64)` per inbound report; `window.__dsp_onState(connected)` when the
+device opens, fails to open, or is detached (`ACTION_USB_DEVICE_DETACHED`).
 
 That's the whole interface. The Kotlin side is a *dumb byte pipe* — it knows nothing about the
 protocol.
@@ -148,5 +149,5 @@ secret names are in the workflow header.
 
 Verified end-to-end on a Pixel 8 Pro over USB-OTG: attach → permission → version handshake
 (`4x4MINIPRO V010`) → full state readback/hydrate → preset recall, routing and live meters.
-Released as `v0.2.0`. Open gap: hot-unplug doesn't yet tear down the UI (the desktop WebHID
-transport has the same gap).
+Released as `v0.2.0`. Hot-unplug is reported through `__dsp_onState(false)` (detach receiver)
+and moves the connection to "lost"; replugging re-binds via the attach intent.

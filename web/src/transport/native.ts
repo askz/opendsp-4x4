@@ -1,12 +1,14 @@
-// Native USB transport for the Android WebView shell. The Kotlin side exposes a
-// synchronous byte pipe as window.AndroidUsb and pushes inbound reports back via
-// window.__dsp_onReport. All request/retry timing lives here — identical to
-// webhid.ts — so only the write call and report source differ between platforms.
-import type { DspTransport } from "./transport.ts";
+// Native USB link for the Android WebView shell. The Kotlin side exposes a byte
+// pipe as window.AndroidUsb and pushes events back through two global callbacks:
+// __dsp_onReport(base64) for every inbound report and __dsp_onState(connected)
+// whenever the device opens, fails to open, or goes away.
+import type { HidLink } from "./link.ts";
 
 interface AndroidUsbBridge {
-  open(): void;             // finds the device + raises the system permission dialog; result flows back via __dsp_onState
-  write(b64: string): void; // OUT endpoint; frame bytes as base64
+  /** Find the device, asking for permission if needed; the outcome arrives via __dsp_onState. */
+  open(): void;
+  /** Write one report (base64). Returns false if the USB transfer failed. */
+  write(b64: string): boolean;
   close(): void;
   isConnected(): boolean;
 }
@@ -18,96 +20,119 @@ type Host = {
 };
 const host = (): Host => globalThis as unknown as Host;
 
-const toB64 = (b: Uint8Array): string => {
-  let s = "";
-  for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]!);
-  return btoa(s);
-};
-const fromB64 = (s: string): Uint8Array => {
-  const bin = atob(s);
-  const out = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-  return out;
-};
+const OPEN_TIMEOUT_MS = 30000;
 
-export class NativeTransport implements DspTransport {
-  private listeners = new Set<(r: Uint8Array) => void>();
-  private pending: ((r: Uint8Array | null) => void) | null = null;
-  private chain: Promise<unknown> = Promise.resolve();
-  private _open = false;
-  private openWaiter: (() => void) | null = null;
+const reportListeners = new Set<(report: Uint8Array) => void>();
+const stateListeners = new Set<(connected: boolean) => void>();
 
-  /** True when running inside the Android shell (bridge injected). */
-  static supported(): boolean { return typeof host().AndroidUsb !== "undefined"; }
-  /** True when the device is already open (attach intent pre-grants permission). */
-  static connected(): boolean { return host().AndroidUsb?.isConnected() ?? false; }
+function installHostCallbacks(): void {
+  host().__dsp_onReport = (b64) => {
+    const report = fromB64(b64);
+    for (const listener of reportListeners) listener(report);
+  };
+  host().__dsp_onState = (connected) => {
+    for (const listener of [...stateListeners]) listener(connected);
+  };
+}
 
-  get isOpen(): boolean { return this._open; }
-  get productName(): string { return "DSP 4x4 Mini Pro"; }
+function requireBridge(): AndroidUsbBridge {
+  const bridge = host().AndroidUsb;
+  if (!bridge) throw new Error("Android USB bridge unavailable");
+  return bridge;
+}
+
+function toB64(bytes: Uint8Array): string {
+  let binary = "";
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+function fromB64(b64: string): Uint8Array {
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+export class NativeLink implements HidLink {
+  readonly productName = "DSP 4x4 Mini Pro";
+  private readonly disconnectListeners = new Set<() => void>();
+  private readonly ownReportListeners = new Set<(report: Uint8Array) => void>();
+  private unsubscribeState: (() => void) | null = null;
+
+  /** True when running inside the Android shell. */
+  static supported(): boolean {
+    return typeof host().AndroidUsb !== "undefined";
+  }
+
+  /** True when the device is already open (the USB attach intent pre-grants permission). */
+  static connected(): boolean {
+    return host().AndroidUsb?.isConnected() ?? false;
+  }
+
+  /** Notify when the shell opens the device on its own (USB attach intent). */
+  static onAttach(listener: (link: NativeLink) => void): () => void {
+    if (!NativeLink.supported()) return () => {};
+    installHostCallbacks();
+    const handler = (connected: boolean) => {
+      if (connected) listener(new NativeLink());
+    };
+    stateListeners.add(handler);
+    return () => stateListeners.delete(handler);
+  }
 
   async open(): Promise<void> {
-    const bridge = host().AndroidUsb;
-    if (!bridge) throw new Error("Android USB bridge unavailable");
-    host().__dsp_onReport = (b64) => this.handleReport(fromB64(b64));
-    host().__dsp_onState = (connected) => {
-      this._open = connected;
-      if (connected && this.openWaiter) { const w = this.openWaiter; this.openWaiter = null; w(); }
+    const bridge = requireBridge();
+    installHostCallbacks();
+    if (!bridge.isConnected()) await this.awaitOpen(bridge);
+    const onState = (connected: boolean) => {
+      if (connected) return;
+      for (const listener of this.disconnectListeners) listener();
     };
-    if (bridge.isConnected()) { this._open = true; return; }
-    // open() pops the permission dialog; the connection completes asynchronously via __dsp_onState.
-    await new Promise<void>((resolve, reject) => {
-      const timer = setTimeout(() => { this.openWaiter = null; reject(new Error("USB permission/connect timeout")); }, 30000);
-      this.openWaiter = () => { clearTimeout(timer); resolve(); };
-      bridge.open();
-    });
+    stateListeners.add(onState);
+    this.unsubscribeState = () => stateListeners.delete(onState);
   }
 
   async close(): Promise<void> {
-    host().__dsp_onReport = undefined;
-    host().__dsp_onState = undefined;
+    this.unsubscribeState?.();
+    this.unsubscribeState = null;
+    for (const listener of this.ownReportListeners) reportListeners.delete(listener);
+    this.ownReportListeners.clear();
     host().AndroidUsb?.close();
-    this._open = false;
   }
 
-  private handleReport(bytes: Uint8Array): void {
-    if (this.pending) {
-      const resolve = this.pending;
-      this.pending = null;
-      resolve(bytes);
-    }
-    for (const cb of this.listeners) cb(bytes);
+  async write(report: Uint8Array): Promise<void> {
+    if (requireBridge().write(toB64(report)) === false) throw new Error("USB transfer failed");
   }
 
-  onReport(cb: (r: Uint8Array) => void): () => void {
-    this.listeners.add(cb);
-    return () => this.listeners.delete(cb);
+  onReport(listener: (report: Uint8Array) => void): () => void {
+    this.ownReportListeners.add(listener);
+    reportListeners.add(listener);
+    return () => {
+      this.ownReportListeners.delete(listener);
+      reportListeners.delete(listener);
+    };
   }
 
-  // Serialize requests: each awaits the previous, so a debounced burst can't race
-  // the single-pending reply slot (one in-flight transaction at a time).
-  async request(frame: Uint8Array, timeoutMs = 1200): Promise<Uint8Array> {
-    const run = this.chain.then(() => this.sendOne(frame, timeoutMs));
-    this.chain = run.then(() => undefined, () => undefined);
-    return run;
+  onDisconnect(listener: () => void): () => void {
+    this.disconnectListeners.add(listener);
+    return () => this.disconnectListeners.delete(listener);
   }
 
-  private async sendOne(frame: Uint8Array, timeoutMs: number): Promise<Uint8Array> {
-    const bridge = host().AndroidUsb;
-    if (!bridge || !this._open) throw new Error("device not open");
-    // The device drops the reply to the first transaction after open, so retry a
-    // few times with a short per-attempt timeout (matches webhid.ts behaviour).
-    const perMs = 400;
-    const b64 = toB64(frame);
-    for (let i = 0; i * perMs < timeoutMs; i++) {
-      const reply = new Promise<Uint8Array | null>((resolve) => {
-        this.pending = resolve;
-        setTimeout(() => { if (this.pending === resolve) { this.pending = null; resolve(null); } }, perMs);
-        try { bridge.write(b64); }
-        catch { if (this.pending === resolve) { this.pending = null; resolve(null); } }
-      });
-      const r = await reply;
-      if (r) return r;
-    }
-    throw new Error("reply timeout");
+  private awaitOpen(bridge: AndroidUsbBridge): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        stateListeners.delete(onState);
+        reject(new Error("USB permission/connect timeout"));
+      }, OPEN_TIMEOUT_MS);
+      const onState = (connected: boolean) => {
+        stateListeners.delete(onState);
+        clearTimeout(timer);
+        if (connected) resolve();
+        else reject(new Error("DSP not found or USB permission denied"));
+      };
+      stateListeners.add(onState);
+      bridge.open();
+    });
   }
 }

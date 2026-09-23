@@ -6,7 +6,7 @@
 //
 // Request payload (host->device): [0x00, addr, N, code, ...data]   N = 1 + data.length
 // Reply payload (device->host):   [addr, ..., code, ...]           (structure varies by command)
-// Payload bytes equal to 0x10 (DLE) are escaped as 0x10 0x10.
+// Payload bytes equal to 0x10 (DLE) are NOT escaped (see frameWrap).
 
 export const DLE = 0x10;
 export const STX = 0x02;
@@ -42,6 +42,17 @@ export function buildRequest(code: number, data: Uint8Array = new Uint8Array(0),
   return out;
 }
 
+/** Command code of a frame built by buildRequest. */
+export function requestCode(frame: Uint8Array): number {
+  return frame[5] ?? 0;
+}
+
+/** Data bytes (after the code) of a frame built by buildRequest. */
+export function requestData(frame: Uint8Array): Uint8Array {
+  const N = frame[4] ?? 0;
+  return frame.slice(6, 5 + N);
+}
+
 export interface Frame {
   /** unescaped payload bytes between STX and the terminating ETX */
   payload: Uint8Array;
@@ -63,6 +74,13 @@ export function parseReply(report: Uint8Array): Reply {
   const { payload, checksumOk } = parseFrame(report);
   const N = payload[2] ?? 0;
   return { code: payload[3] ?? 0, data: payload.slice(4, 3 + N), checksumOk };
+}
+
+/** Parse a device reply, or null unless it is a well-framed report with a valid checksum. */
+export function tryParseReply(report: Uint8Array): Reply | null {
+  if (report.length < 8 || report[0] !== DLE || report[1] !== STX) return null;
+  const reply = parseReply(report);
+  return reply.checksumOk ? reply : null;
 }
 
 /**

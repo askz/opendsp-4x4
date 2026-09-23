@@ -8,8 +8,8 @@
   let storeMode = $state(false);
 
   function fire(slot: number): void {
-    if (storeMode) { device.storePreset(slot); storeMode = false; }
-    else device.recallPreset(slot);
+    if (storeMode) { void device.storePreset(slot); storeMode = false; }
+    else void device.recallPreset(slot);
   }
 </script>
 
@@ -30,7 +30,8 @@
             class:active={device.activePreset === i}
             class:arm={storeMode}
             style="--h: {(i * 47) % 360}"
-            disabled={!device.connected}
+            disabled={!device.connected || !!device.busy}
+            title={device.presetNames[i] ?? ""}
             onclick={() => fire(i)}
           >{i + 1}</button>
         {/each}

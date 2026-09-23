@@ -22,7 +22,8 @@ code             command code
 checksum         = XOR(00, addr, N, code, …data) ^ 1
 ```
 Sent in a 64-byte interrupt OUT report (trailing bytes are stale/ignored). Payload
-bytes equal to 0x10 are escaped as `10 10`. Verified: poll `10 02 00 01 01 40 10 03 41`
+bytes equal to 0x10 are **not** escaped: the device locates the terminator by the length
+field, and escaping breaks the frame (hardware-verified). Verified: poll `10 02 00 01 01 40 10 03 41`
 (0x40, cksum 0x41), mute `10 02 00 01 03 35 04 01 10 03 33`.
 
 **Reply (device→host):**
@@ -43,13 +44,31 @@ Total frame = N+8 bytes (≤ 64). At the codec layer the reply payload is read a
 > Note: a *different* 16-bit one's-complement checksum applies to the unit's RS-232 /
 > network transport — don't confuse it with the USB-HID `XOR(bytes)^1` above.
 
+## Request/reply semantics (measured on `4x4MINIPRO V010 20230106A`)
+- **Queries echo their code** (`0x10`, `0x13`, `0x14`, `0x22`, `0x29`, `0x2c`, `0x40`, `0x52`);
+  `0x27` READ_CHANNEL answers with code `0x24`. Indexed queries (`0x27`, `0x29`) echo the index
+  as the first data byte.
+- **Every write is acked with code `0x01`** (N=1, no data): level, mute, polarity, routing, delay,
+  crossover, PEQ, compressor, gate, recall, store, `0x12` INIT_DONE.
+- **Unknown opcode → code `0x02`** (NAK). **Bad checksum → no reply.**
+- **One transaction at a time.** A frame sent while the device is still processing the previous
+  one is silently dropped (two back-to-back writes produce a single ack).
+- **No unsolicited traffic**: the device only speaks when asked (meters are polled with `0x40`).
+- The first transaction after open is *not* dropped on this firmware.
+- **Timing:** typical round trip 3–10 ms, up to ~40 ms (compressor); **recall ≈ 0.66 s**,
+  **store ≈ 2.2 s** before the ack. Retry windows must be sized per command, or a re-sent
+  recall/store produces a second ack that is mistaken for the reply to the next request.
+- **Preset slots are 0–29** (30 names via `0x29`). The device does **not** range-check
+  recall/store: slot 30 is acked and becomes the active slot.
+- `0x14` returns the **active preset slot**, updated by both recall and store.
+
 ## Confirmed opcode map (observed one control at a time)
 | code | command | payload |
 |------|---------|---------|
 | `0x40` | poll in/out audio **levels** | – (reply carries 8 levels) |
 | `0x35` | **mute** | `[chan, on]` |
 | `0x36` | **polarity** invert | `[chan, invert]` |
-| `0x34` | **level/gain** | `[chan, val16]` raw 0–400; **0 dB=281, +12 dB=400, ~10 units/dB** (linear in normal range, floors at raw 0 ≈ −60 dB) |
+| `0x34` | **level/gain** | `[chan, val16]` raw 0–400; **0 dB=280, +12 dB=400, 10 units/dB** (linear in normal range, floors at raw 0 ≈ −60 dB) |
 | `0x33` | **PEQ band** | `[chan, band, gain16, freq16, q8, type8, bypass8]` (capture-calibrated) |
 | `0x26` | **set name** | 14 ASCII bytes |
 | `0x21`/`0x20` | **store / recall preset** | `[slot]` |
@@ -66,7 +85,7 @@ routing, linking) is exposed by the app.
 | `0x31` | crossover LPF | `[chan, freq16, slope]` | **freq Hz = 19.7·2^(raw/30)**, raw 0–300 (30 steps/oct — coarser than PEQ); slope codes below |
 | `0x32` | crossover HPF | `[chan, freq16, slope]` | same freq scale as LPF |
 | `0x33` | PEQ band | `[chan, band, gain16, freq16, q8, type8, bypass8]` | **gain raw 0–240, 0 dB=120, 0.1 dB/step** (`dB=(raw−120)/10`); **freq = 16-bit log index, Hz=19.7·2^(idx/30)** (idx 0–300, *same scale as crossover*); **q8** single byte (Q scale provisional); type below. NB gain comes first (not RBJ order) — capture-verified (40.3 Hz = idx 31) |
-| `0x34` | level/gain | `[chan, val16]` | raw 0–400; **0 dB=281, +12 dB=400, 10/dB** |
+| `0x34` | level/gain | `[chan, val16]` | raw 0–400; **0 dB=280, +12 dB=400, 10/dB** (factory default of every channel reads back 280) |
 | `0x35` | mute | `[chan, on]` | |
 | `0x36` | polarity | `[chan, invert]` | |
 | `0x38` | delay | `[chan, samples16]` | **48 kHz**; ms=samples/48; max 32640=680 ms |
@@ -76,7 +95,7 @@ routing, linking) is exposed by the app.
 | `0x39` | test tone | `[source, freqIndex]` | source 0=off/input,1=pink,2=white,3=sine; freqIndex 0–30 = 1/3-oct 20 Hz–20 kHz |
 
 **Startup handshake** (observed at editor launch, in order): `0x10`→status byte; `0x13`→version
-string `"4x4MINIPRO V010"`; `0x2c`→7-byte config; `0x22`→30-byte flags/link table; `0x14`→flag;
+string `"4x4MINIPRO V010"`; `0x2c`→7-byte config; `0x22`→30-byte flags/link table; `0x14`→active preset slot;
 `0x29 [0..29]`→read all 30 preset names (14 ASCII); `0x27 [0..8]`→read all 9 channel state
 blocks (reply code `0x24`, 50 bytes each: name + DSP params); `0x12`→finalize (ack `0x01`);
 then steady `0x40` level polling. (`0x52` also returns a longer version string, e.g.
@@ -126,3 +145,6 @@ sends high-level parameters (freq/gain/Q/type); the device computes the biquads 
 **Remaining gaps:** PEQ Q encoding (`q8`) is golden-confirmed at the values used but its full
 range vs the editor's display isn't swept; mute has no readback (defaults un-muted on connect);
 a handful of low opcodes seen in the startup handshake are unmapped readback variants.
+Compressor/gate times: the factory defaults read back as raw 49/99/499 while the editor's
+defaults are 50/100/500 ms, which suggests `ms = raw + 1`; unconfirmed, so times are still
+passed through raw.

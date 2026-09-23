@@ -33,13 +33,14 @@ test("GOLDEN: polarity invert/normal Output 1 (0x36) matches capture", () => {
   assert.equal(hex(polarityFrame(Channel.OUT_1, false), 8), "10 02 00 01 03 36 04 00");
 });
 
-test("gain dB<->raw calibration (0dB=281, +12dB=400, 10 units/dB)", () => {
-  assert.equal(gainDbToRaw(0), 281);
-  assert.equal(gainDbToRaw(12), 400);   // clamped at max (281+120=401 -> 400)
-  assert.equal(gainDbToRaw(-6), 221);
+test("gain dB<->raw calibration (0dB=280, +12dB=400, 10 units/dB)", () => {
+  assert.equal(gainDbToRaw(0), 280);    // factory default of every channel
+  assert.equal(gainDbToRaw(12), 400);
+  assert.equal(gainDbToRaw(13), 400);   // clamped at max
+  assert.equal(gainDbToRaw(-6), 220);
   assert.equal(gainDbToRaw(-100), 0);   // floored
-  assert.equal(Math.round(gainRawToDb(281)), 0);
-  assert.equal(gainRawToDb(291), 1);
+  assert.equal(gainRawToDb(280), 0);
+  assert.equal(gainRawToDb(290), 1);
 });
 
 test("level frame carries chan + 16-bit LE value", () => {

@@ -6,7 +6,7 @@ export const Command = {
   GET_STATUS: 0x10,    // reply 1 byte (model/status, observed 0x1f)
   INIT_DONE: 0x12,     // finalize handshake; device acks reply code 0x01
   GET_VERSION: 0x13,   // reply ASCII version "4x4MINIPRO V010"
-  GET_FLAG: 0x14,      // reply 1 byte
+  GET_ACTIVE_PRESET: 0x14, // reply 1 byte: active preset slot (tracks recall/store)
   GET_FLAGS_BLOCK: 0x22, // reply 30-byte flags/link table
   READ_CHANNEL: 0x27,  // [index 0..8] -> reply code 0x24, 50-byte channel state
   READ_PRESET_NAME: 0x29, // [index 0..29] -> reply 14-byte preset name
@@ -22,7 +22,7 @@ export const Command = {
   CROSSOVER_LPF: 0x31, // [chan, freq16, slope]
   CROSSOVER_HPF: 0x32, // [chan, freq16, slope]
   PEQ_BAND: 0x33,      // [chan, band, gain16, freq16, q8, type8, bypass8]
-  LEVEL: 0x34,         // [chan, val16] raw 0..400; 0dB=281, +12dB=400, ~10 units/dB
+  LEVEL: 0x34,         // [chan, val16] raw 0..400; 0dB=280, +12dB=400, 10 units/dB
   MUTE: 0x35,          // [chan, on(1)/off(0)]
   POLARITY: 0x36,      // [chan, invert(1)/normal(0)]
   DELAY: 0x38,         // [chan, samples16] @48kHz (ms = samples/48; max 32640 = 680ms)
@@ -33,6 +33,14 @@ export const Command = {
   GET_VERSION_FW: 0x52,
 } as const;
 
+/** Reply codes that are not an echo of the request code. Every write is acked with
+ *  ACK; an unknown opcode is answered with NAK; a bad checksum gets no reply at all. */
+export const ReplyCode = { ACK: 0x01, NAK: 0x02 } as const;
+
+/** Preset slots 0..29 (names readable via 0x29). The device does not range-check
+ *  recall/store, so callers must. */
+export const PRESET_SLOT_COUNT = 30;
+
 // Channel numbering, from capture (Output 1 = 0x04). To confirm for inputs.
 export const Channel = {
   IN_A: 0x00, IN_B: 0x01, IN_C: 0x02, IN_D: 0x03,
@@ -40,7 +48,7 @@ export const Channel = {
 } as const;
 
 export const KNOWN_COMMANDS: Readonly<Record<number, string>> = {
-  0x10: "GET_STATUS", 0x12: "INIT_DONE", 0x13: "GET_VERSION", 0x14: "GET_FLAG",
+  0x10: "GET_STATUS", 0x12: "INIT_DONE", 0x13: "GET_VERSION", 0x14: "GET_ACTIVE_PRESET",
   0x20: "RECALL_PRESET", 0x21: "STORE_PRESET", 0x22: "GET_FLAGS_BLOCK", 0x24: "REPLY_CHANNEL",
   0x26: "SET_NAME", 0x27: "READ_CHANNEL", 0x29: "READ_PRESET_NAME", 0x2c: "GET_CONFIG",
   0x2f: "SET_PASSWORD", 0x39: "TEST_TONE",

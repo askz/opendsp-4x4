@@ -15,7 +15,7 @@ class Bridge(private val webView: WebView, private val usb: UsbHid) {
     fun open() = usb.open()
 
     @JavascriptInterface
-    fun write(b64: String) = usb.write(Base64.decode(b64, Base64.NO_WRAP))
+    fun write(b64: String): Boolean = usb.write(Base64.decode(b64, Base64.NO_WRAP))
 
     @JavascriptInterface
     fun close() = usb.close()

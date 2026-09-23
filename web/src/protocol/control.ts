@@ -19,10 +19,10 @@ export function levelRawFrame(chan: number, raw16: number): Uint8Array {
   return buildRequest(Command.LEVEL, Uint8Array.of(chan & 0xff, v & 0xff, (v >> 8) & 0xff));
 }
 
-// Gain mapping, calibrated from 0.1 dB stepping: 0 dB = raw 281, +12 dB = raw 400,
-// ~10 raw units per dB. Linear-in-dB through the normal range; the device floors at
-// raw 0 (shown as the −60 dB minimum), so deep-negative dB is approximate.
-const GAIN_ZERO_DB = 281;
+// Gain mapping: 0 dB = raw 280 (the factory-default value of every channel),
+// +12 dB = raw 400, 10 raw units per dB. Linear-in-dB through the normal range; the
+// device floors at raw 0 (shown as the −60 dB minimum), so deep-negative dB is approximate.
+const GAIN_ZERO_DB = 280;
 const GAIN_UNITS_PER_DB = 10;
 export const GAIN_MAX_RAW = 400; // ≈ +12 dB
 
@@ -48,6 +48,16 @@ export function storePresetFrame(slot: number): Uint8Array {
 
 export function getVersionFrame(): Uint8Array {
   return buildRequest(Command.GET_VERSION);
+}
+
+/** Long version query, e.g. "4x4MINIPRO V010 20230106A". */
+export function getFirmwareVersionFrame(): Uint8Array {
+  return buildRequest(Command.GET_VERSION_FW);
+}
+
+/** Active preset slot (0..29), updated by recall and store. */
+export function getActivePresetFrame(): Uint8Array {
+  return buildRequest(Command.GET_ACTIVE_PRESET);
 }
 
 /** Status/wake query — the editor sends this first after connecting (0x13 only replies after it). */

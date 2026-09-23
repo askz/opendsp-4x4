@@ -40,7 +40,9 @@ class UsbHid(
     private var iface: UsbInterface? = null
     private var epIn: UsbEndpoint? = null
     private var epOut: UsbEndpoint? = null
+    private var device: UsbDevice? = null
     private var readThread: Thread? = null
+    private var detachRegistered = false
     @Volatile private var running = false
 
     fun isConnected(): Boolean = connection != null
@@ -53,20 +55,43 @@ class UsbHid(
         if (usb.hasPermission(device)) openDevice(device) else requestPermission(device)
     }
 
-    fun write(bytes: ByteArray) {
-        val conn = connection ?: return
-        val ep = epOut ?: return
-        conn.bulkTransfer(ep, bytes, bytes.size, IO_TIMEOUT)
+    /** Write one report; false if the device isn't open or the transfer failed. */
+    fun write(bytes: ByteArray): Boolean {
+        val conn = connection ?: return false
+        val ep = epOut ?: return false
+        return conn.bulkTransfer(ep, bytes, bytes.size, IO_TIMEOUT) >= 0
     }
 
     fun close() {
         running = false
         readThread?.join(300)
         readThread = null
+        if (detachRegistered) {
+            context.unregisterReceiver(detachReceiver)
+            detachRegistered = false
+        }
         iface?.let { connection?.releaseInterface(it) }
         connection?.close()
-        connection = null; iface = null; epIn = null; epOut = null
+        connection = null; iface = null; epIn = null; epOut = null; device = null
         onState(false)
+    }
+
+    private val detachReceiver = object : BroadcastReceiver() {
+        override fun onReceive(c: Context, intent: Intent) {
+            if (intent.action != UsbManager.ACTION_USB_DEVICE_DETACHED) return
+            val detached = deviceFrom(intent) ?: return
+            if (detached.deviceName == device?.deviceName) close()
+        }
+    }
+
+    private fun registerDetachReceiver() {
+        if (detachRegistered) return
+        val filter = IntentFilter(UsbManager.ACTION_USB_DEVICE_DETACHED)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+            context.registerReceiver(detachReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        else
+            @Suppress("UnspecifiedRegisterReceiverFlag") context.registerReceiver(detachReceiver, filter)
+        detachRegistered = true
     }
 
     private fun findDevice(): UsbDevice? =
@@ -119,7 +144,8 @@ class UsbHid(
             conn.close(); onState(false); return
         }
 
-        connection = conn; iface = intf; epIn = ein; epOut = eout
+        connection = conn; iface = intf; epIn = ein; epOut = eout; this.device = device
+        registerDetachReceiver()
         startReadThread()
         onState(true)
     }

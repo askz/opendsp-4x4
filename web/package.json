@@ -10,7 +10,8 @@
     "build": "vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
-    "test": "node --experimental-strip-types --test 'test/*.test.ts'"
+    "test": "node --experimental-strip-types --test 'test/*.test.ts'",
+    "hw:smoke": "node --experimental-strip-types tools/hw-smoke.ts"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^5.1.1",

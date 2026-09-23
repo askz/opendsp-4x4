@@ -1,27 +1,43 @@
 <script lang="ts">
   import { device } from "./state/device.svelte.ts";
-  import { NativeTransport } from "./transport/native.ts";
   import PatchBoard from "./components/PatchBoard.svelte";
   import PresetPads from "./components/PresetPads.svelte";
   import TestTonePanel from "./components/TestTonePanel.svelte";
   import LockDialog from "./components/LockDialog.svelte";
 
-  // Reachable either via WebHID (desktop) or the Android native USB bridge.
-  const supported = NativeTransport.supported() || (typeof navigator !== "undefined" && "hid" in navigator);
+  const PHASE_LABEL = {
+    unsupported: "Unsupported browser", idle: "Not connected", connecting: "Connecting…",
+    syncing: "Reading device…", ready: "Connected", lost: "Connection lost",
+  } as const;
+  const status = $derived(
+    device.busy ? `${device.busy}…`
+      : device.connected ? device.info?.firmware || device.info?.version || device.productName
+      : device.connectionError || PHASE_LABEL[device.phase],
+  );
+  const working = $derived(device.phase === "connecting" || device.phase === "syncing");
   let showSystem = $state(false);
 </script>
 
 <header class="top">
   <strong>openDSP-4x4</strong><span class="muted"> · t.racks DSP 4x4 Mini Pro</span>
   <span class="spacer"></span>
-  <span class="dot" class:ok={device.connected}></span>
-  <span class="status" class:ok={device.connected}>{device.connected ? device.version || device.productName : device.error || "Not connected"}</span>
-  <button class="primary" onclick={() => device.connect()}>{device.connected ? "Reconnect…" : "Connect DSP…"}</button>
+  {#if device.lastIssue}
+    <button class="issue" title={device.issues.map((i) => i.message).join("\n")} onclick={() => device.clearIssues()}>
+      {device.issues.length} issue{device.issues.length === 1 ? "" : "s"}: {device.lastIssue.message}
+    </button>
+  {/if}
+  <span class="dot" class:ok={device.connected} class:busy={working}></span>
+  <span class="status" class:ok={device.connected} title={status}>{status}</span>
+  {#if device.connected}
+    <button onclick={() => device.disconnect()}>Disconnect</button>
+  {:else}
+    <button class="primary" disabled={!device.supported || working} onclick={() => device.connect()}>Connect DSP…</button>
+  {/if}
 </header>
 
 <PresetPads />
 
-{#if !supported}<div class="warn-box">WebHID isn't available — use <b>Chrome</b> or <b>Edge</b> on desktop.</div>{/if}
+{#if !device.supported}<div class="warn-box">WebHID isn't available — use <b>Chrome</b> or <b>Edge</b> on desktop.</div>{/if}
 
 <PatchBoard />
 
@@ -52,6 +68,8 @@
   .spacer { flex: 1; }
   .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--bad); box-shadow: 0 0 8px var(--bad); }
   .dot.ok { background: var(--good); box-shadow: 0 0 8px var(--good); }
+  .dot.busy { background: var(--warn); box-shadow: 0 0 8px var(--warn); }
+  .issue { max-width: 36ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .78rem; color: var(--warn); border-color: var(--warn); }
   .status { font-size: .82rem; color: var(--text-dim); max-width: 22ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .status.ok { color: var(--good); }
   button.on { border-color: var(--accent); }

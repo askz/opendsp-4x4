@@ -1,1 +1,0 @@
-Open control for the t.racks DSP 4x4 Mini Pro over USB-OTG.

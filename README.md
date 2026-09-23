@@ -1,73 +1,112 @@
-# openDSP-4x4 — portable control for the t.racks DSP 4x4 Mini Pro
+# openDSP-4x4
 
-<p align="center">
-  <a href="https://github.com/GlassOnTin/opendsp-4x4/releases/latest"><img src="https://img.shields.io/github/v/release/GlassOnTin/opendsp-4x4?style=flat-square&label=release&color=blue" alt="Release" /></a>
-  <a href="https://glassontin.github.io/opendsp-4x4/"><img src="https://img.shields.io/badge/web%20app-live-38bdf8?style=flat-square&logo=googlechrome&logoColor=white" alt="Web app" /></a>
-  <img src="https://img.shields.io/badge/Android-7.0%2B-3ddc84?style=flat-square&logo=android&logoColor=white" alt="Android 7.0+" />
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-AGPL--3.0-orange?style=flat-square" alt="License: AGPL-3.0" /></a>
-  <a href="https://ko-fi.com/glassontin"><img src="https://img.shields.io/badge/Ko--fi-support-ff5e5b?style=flat-square&logo=ko-fi&logoColor=white" alt="Support on Ko-fi" /></a>
-</p>
+Open-source control software for the **t.racks DSP 4x4 Mini Pro** (a 4-in / 4-out DSP whose
+vendor editor is Windows-only). Runs in desktop Chrome/Edge over WebHID with nothing to install,
+and on Android phones/tablets over USB-OTG.
 
-Open-source, cross-platform control software for the **the t.racks DSP 4x4 Mini Pro**
-(a 4-in/4-out XLR DSP that ships with Windows-only editor software).
+**[Open the web app](https://askz.github.io/opendsp-4x4/)** · plug the DSP in, click *Connect…*
 
-<p align="center">
-  <img src="docs/img/android-hero.png" width="300"
-       alt="openDSP-4x4 on an Android phone over USB-OTG: coloured preset pads, four input and four output channel strips, and a routing matrix">
-</p>
+![openDSP-4x4: tabbed editor with channel tabs and live meters, an output page with EQ graph, filter table and compressor](docs/screenshot.png)
 
-**[▶ Open the web app](https://glassontin.github.io/opendsp-4x4/)** — desktop Chrome/Edge over
-WebHID; nothing to install. &nbsp;·&nbsp; **[⬇ Android APK](https://github.com/GlassOnTin/opendsp-4x4/releases/latest)** —
-phone/tablet over USB-OTG. &nbsp;Plug the DSP in and tap *Connect*.
+This is a hard fork of [GlassOnTin/opendsp-4x4](https://github.com/GlassOnTin/opendsp-4x4)
+with a rebuilt transport, state layer and UI.
 
-![openDSP-4x4 web app: a patch-board view with input/output nodes, patch cables, and an interactive 7-band parametric EQ](docs/screenshot.png)
+## Features
 
-Goals:
-- **Portable GUI** on desktop (Linux/Windows/macOS) and **Android over USB-OTG** — control
-  the DSP from a phone/tablet at a gig.
-- Eventual **full editor parity**: PEQ, crossovers, delays, limiters, gain/mute, routing,
-  presets.
-- Clean, strongly-typed, well-separated codebase; everything driven by one documented
-  protocol.
+- **All device parameters**: gain, mute, polarity, delay, routing, 7-band PEQ (peak, shelves,
+  pass, all-pass), high/low-pass crossovers (Butterworth, Bessel, Linkwitz-Riley), compressor /
+  limiter, noise gate, test tone, front-panel lock password.
+- **Classic editor layout**: overview of all eight channels plus routing matrix, one tab per
+  channel, System page (device facts, 30 preset slots, preset files, issue log). Works at
+  phone width.
+- **Exact values**: every edit is quantized to the device's own resolution (0.1 dB gain,
+  1/30-octave frequency, Q in 0.1 steps, 1/48 ms delay), so what the screen shows is what the
+  DSP stores. Verified by reading the device back after writing.
+- **Undo / redo** (Ctrl/⌘+Z, Ctrl/⌘+Shift+Z) for every parameter; a fader or EQ-handle drag is
+  one step.
+- **Delivery tracking**: each parameter shows whether it is sending, rejected, or not sent
+  (offline), with a *Resend* action. Nothing fails silently.
+- **Presets**: recall/store the 30 device slots (store asks for confirmation); after a recall
+  the app re-reads the device so the screen matches what is loaded. **Preset files** export the
+  full live state as JSON and import it back as one undoable change, with strict validation.
+- **Robust connection**: automatic reconnect when a granted device is plugged back in,
+  detection of unplugged or unresponsive devices, meters that never delay a user edit.
+- **EQ link** (mirror edits across two outputs) and **copy EQ** between outputs.
+- Keyboard: `0` overview, `1`–`8` channels, `9` system; arrows / PageUp / PageDown / wheel step
+  numeric fields (Shift ×10, Alt ×0.1); values accept `1.2k`, `-6,5 dB`, …
 
-## Status — desktop (WebHID) and Android (USB-OTG) apps both working and verified on hardware.
+## Status and known gaps
 
-The device is a USB-HID device (`0168:0821`) using 64-byte interrupt reports. The control
-protocol was developed **clean-room**, by observing the device's USB-HID traffic and probing
-it directly (write a known value, read it back, match the bytes); see [`PROTOCOL.md`](PROTOCOL.md).
-The protocol is the single source of truth and is implemented per-platform:
+Desktop (WebHID) is verified on hardware (`4x4MINIPRO V010 20230106A`). The Android shell
+builds in CI; the new file import/export bridge still needs a test on a phone.
 
-- **`web/`** — TypeScript + **WebHID** desktop app (Chrome/Edge). Zero-install. Routing,
-  gain/mute/polarity, 7-band PEQ, crossovers, compressor, gate, delay, presets, live meters
-  and full device-state readback are implemented and **live-verified on the hardware**.
-  Known gaps: PEQ Q scaling is provisional and gate timing isn't yet calibrated to ms.
-- **`android/`** — a thin **WebView** shell that loads the same web UI (bundled offline) and
-  supplies USB-host byte I/O through a small Kotlin layer + a JS bridge — the only path that
-  reaches the device on Android (WebHID is desktop-only; WebUSB blocks the HID class). Built,
-  released (`v0.2.0`) and **verified on a Pixel 8 Pro over USB-OTG**: permission, version
-  handshake, state readback, preset recall, routing and meters.
-  See the [build walkthrough](ANDROID.md) for how it's put together.
+- **Mute and PEQ-band bypass have no readback** on this device. After connecting they are
+  shown as unknown (`?`) until you set them.
+- **Gain below −28 dB**: the linear mapping (0 dB = raw 280, 10 raw units/dB) is verified from
+  −28 to +12 dB; the device's raw 0 is its minimum, so lower values are not offered.
+- **Compressor/gate times** are passed through as raw values. Factory defaults read back as
+  49/99/499 where the vendor editor shows 50/100/500 ms, suggesting `ms = raw + 1`
+  (unconfirmed).
+
+See [`PROTOCOL.md`](PROTOCOL.md) for the measured protocol, including request/reply rules and
+timing.
+
+## Development
+
+```sh
+cd web
+npm ci
+npm run dev            # http://localhost:5173 (WebHID needs Chrome/Edge)
+npm run typecheck      # tsc + svelte-check
+npm test               # unit tests (node --test)
+npm run build
+```
+
+- **No hardware?** Open the dev server with `?mock` (e.g. `http://localhost:5173/?mock`) to run
+  against a simulated DSP that reproduces the real device's replies and timing.
+- **Hardware smoke test (Linux)**: with the DSP plugged in and no browser tab using it,
+  `npm run hw:smoke -- /dev/hidrawN` runs the production transport, connection and editor
+  against the device through hidraw (find `N` with
+  `grep -l 0168 /sys/class/hidraw/*/device/uevent`). It changes Out 1 and a few other
+  parameters, restores them, and re-recalls the active preset.
+- **Android**: [`ANDROID.md`](ANDROID.md) explains the WebView shell and USB bridge;
+  `android/build-apk.sh` builds a debug APK (Android SDK + JDK 17). CI builds one on every push.
+
+### Architecture
+
+```
+web/src/
+  protocol/   frame codec, command builders, readback decoders, reply rules (pure)
+  transport/  HidLink (WebHID / Android bridge / mock) → RequestChannel
+              (one transaction in flight, reply matching, retries, priority lanes, coalescing)
+  dsp.ts      typed client for every command
+  state/      connection lifecycle · parameter registry · editor (undo, links, delivery
+              tracking) · readback → model · preset files · Svelte store facade
+  shell/ views/ channel/ ui/   Svelte 5 UI
+```
+
+Everything below `shell/`/`views/` is plain TypeScript with unit tests; the UI only calls the
+store facade.
 
 ## Repo layout
-- [`PROTOCOL.md`](PROTOCOL.md) — the wire protocol (frame format, command codes, data model).
-- [`web/`](web/) — TypeScript protocol codec + WebHID app (also bundled into the Android shell).
-- [`android/`](android/) — WebView shell + Kotlin USB-host layer for the Android USB-OTG build.
-- [`ANDROID.md`](ANDROID.md) — how the Android app is built (WebView + USB-bridge walkthrough).
-- [`docs/CAPTURING.md`](docs/CAPTURING.md) — record a USB session to help add support for more devices.
 
-## Support
-openDSP-4x4 is free and AGPL-licensed. If it saved your gig, you can
-**[buy me a coffee on Ko-fi](https://ko-fi.com/glassontin)** ☕ — entirely optional, always appreciated.
+- [`PROTOCOL.md`](PROTOCOL.md): wire protocol (frame format, commands, data model, timing).
+- [`web/`](web/): protocol codec, transport, state and UI (also bundled into the Android shell).
+- [`android/`](android/): WebView shell + Kotlin USB-host and file bridges.
+- [`docs/CAPTURING.md`](docs/CAPTURING.md): recording a USB session to help support more devices.
 
 ## Legal
-Independent, **clean-room** interoperability implementation: the control protocol was
-developed solely by observing the device's USB-HID interface. "the t.racks" is a trademark
-of Thomann; this project is not affiliated with or endorsed by Thomann.
 
-Licensed under **GNU AGPL-3.0-or-later** (see `LICENSE`) — strong copyleft: any
-distributed or network-served derivative must publish its source under the same terms.
+Independent, clean-room interoperability implementation: the protocol was developed by
+observing the device's USB-HID traffic and probing the device. "the t.racks" is a trademark of
+Thomann; this project is not affiliated with or endorsed by Thomann.
+
+Licensed under the **GNU AGPL-3.0-or-later** (see [`LICENSE`](LICENSE)): any distributed or
+network-served derivative must publish its source under the same terms.
 
     Copyright (C) 2026 Ian Williams
+    Modified 2026 by askz (https://github.com/askz/opendsp-4x4): new transport, state layer and UI.
+
     This program is free software: you can redistribute it and/or modify it under the
     terms of the GNU Affero General Public License as published by the Free Software
     Foundation, either version 3 of the License, or (at your option) any later version.

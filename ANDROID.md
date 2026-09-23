@@ -78,6 +78,13 @@ device opens, fails to open, or is detached (`ACTION_USB_DEVICE_DETACHED`).
 That's the whole interface. The Kotlin side is a *dumb byte pipe* — it knows nothing about the
 protocol.
 
+**Preset files** need two more small pieces, because a WebView neither downloads blobs nor opens
+a file picker by itself ([`FileBridge.kt`](android/app/src/main/java/net/opendsp/x4x4/FileBridge.kt)):
+`window.AndroidFiles.save(name, mimeType, text)` opens the system "save as" dialog (Storage
+Access Framework) and writes the document, and a `WebChromeClient.onShowFileChooser` makes
+`<input type="file">` work for import. [`files.ts`](web/src/ui/files.ts) picks the bridge when
+it is present.
+
 ## Step 3 — the Kotlin shell (`android/`)
 
 Three small files:

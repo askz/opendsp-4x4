@@ -142,6 +142,11 @@ corrected in the codec.
 Built + golden-tested in `web/src/protocol/{commands,control,blocks,readback}.ts`. The codec
 sends high-level parameters (freq/gain/Q/type); the device computes the biquads internally.
 
+The editor quantizes every value to these encodings before sending
+(`web/src/state/params.ts`). `npm run hw:smoke` writes PEQ bands, a crossover, delay,
+compressor, gate, gain and routing, reads the preset image back and checks that the device
+holds exactly the model's values (verified on `4x4MINIPRO V010 20230106A`).
+
 **Remaining gaps:** PEQ Q encoding (`q8`) is golden-confirmed at the values used but its full
 range vs the editor's display isn't swept; mute has no readback (defaults un-muted on connect);
 a handful of low opcodes seen in the startup handshake are unmapped readback variants.

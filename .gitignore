@@ -8,6 +8,9 @@ build/
 .env
 .env.*.local
 
+# Vendor software kept locally for traffic captures (proprietary, never commit)
+*.exe
+
 # Editor / OS cruft
 .DS_Store
 .vscode/

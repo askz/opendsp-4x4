@@ -1,45 +1,81 @@
-/* openDSP-4x4 — dark "pro-audio" theme tokens */
+/* openDSP-4x4: flat, dense, neutral theme. One accent colour for selection/focus,
+   status colours only for status. */
 :root {
   color-scheme: dark;
-  --bg: #0b0e13;
-  --bg-panel: #141922;
-  --bg-elev: #1b212c;
-  --line: #283040;
-  --text: #e8edf4;
-  --text-dim: #93a0b4;
-  --accent: #38bdf8;          /* cyan */
-  --accent-2: #a78bfa;        /* violet */
-  --good: #4ade80;
-  --warn: #fbbf24;
-  --bad: #f87171;
-  /* per-channel accents (In A–D, Out 1–4) */
-  --ch-0: #f472b6; --ch-1: #fb923c; --ch-2: #facc15; --ch-3: #a3e635;
-  --ch-4: #38bdf8; --ch-5: #818cf8; --ch-6: #c084fc; --ch-7: #2dd4bf;
-  --radius: 10px;
-  --glow: 0 0 0 1px rgba(56,189,248,.25), 0 0 16px -4px rgba(56,189,248,.45);
-  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  --bg: #111316;
+  --surface: #181b1f;
+  --surface-2: #1f2328;
+  --surface-3: #272c32;
+  --line: #2e333a;
+  --line-strong: #3d434b;
+  --text: #e3e6ea;
+  --text-dim: #9aa2ad;
+  --text-faint: #6b737e;
+  --accent: #5b9dff;
+  --accent-dim: #2b4a78;
+  --ok: #4cc38a;
+  --warn: #e0a93b;
+  --bad: #e5534b;
+  --meter-lo: #3fae74;
+  --meter-mid: #d6b13a;
+  --meter-hi: #e5534b;
+
+  /* channel identity markers (tabs, strips): muted, never used as fills */
+  --ch-0: #d97aa6; --ch-1: #d9925a; --ch-2: #cfc05a; --ch-3: #8fc25a;
+  --ch-4: #5aa7d9; --ch-5: #7f8ad9; --ch-6: #a97fd9; --ch-7: #5ac2b4;
+
+  --radius: 3px;
+  --gap: 8px;
+  --control-h: 28px;
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  --safe-top: 0px;
+  --safe-bottom: 0px;
+  font-family: var(--font);
+  font-size: 13px;
+  line-height: 1.35;
 }
 
 * { box-sizing: border-box; }
-html, body { height: 100%; }
-body {
-  margin: 0;
-  background: radial-gradient(1200px 600px at 70% -10%, #11202e 0%, var(--bg) 55%);
-  color: var(--text);
-  font-size: 14px;
-}
-#app { min-height: 100vh; display: flex; flex-direction: column; }
+html, body { height: 100%; margin: 0; }
+body { background: var(--bg); color: var(--text); overflow: hidden; }
+#app { height: 100%; display: flex; flex-direction: column; }
+
+button, input, select { font: inherit; color: inherit; }
 
 button {
-  background: var(--bg-elev); color: var(--text);
-  border: 1px solid var(--line); border-radius: var(--radius);
-  padding: .5rem .85rem; font: inherit; cursor: pointer;
-  transition: border-color .15s, box-shadow .15s, background .15s;
+  height: var(--control-h);
+  padding: 0 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+  cursor: pointer;
+  white-space: nowrap;
 }
-button:hover:not(:disabled) { border-color: var(--accent); }
-button:disabled { opacity: .45; cursor: not-allowed; }
-button.primary { background: linear-gradient(180deg, #1d4ed8, #1e40af); border-color: #2563eb; }
-button.primary:hover { box-shadow: var(--glow); }
+button:hover:not(:disabled) { background: var(--surface-3); }
+button:disabled { opacity: .45; cursor: default; }
+button.primary { background: var(--accent-dim); border-color: var(--accent); }
+button.primary:hover:not(:disabled) { background: #33588f; }
+button.danger { border-color: var(--bad); color: #ffd3d0; }
+button.ghost { background: transparent; border-color: transparent; }
+button.ghost:hover:not(:disabled) { background: var(--surface-3); }
 
-.muted { color: var(--text-dim); }
-.mono { font-family: ui-monospace, "JetBrains Mono", monospace; }
+select, input[type="text"], input[type="password"] {
+  height: var(--control-h);
+  padding: 0 6px;
+  background: var(--surface);
+  border: 1px solid var(--line-strong);
+  border-radius: var(--radius);
+}
+select { padding-right: 2px; }
+
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.num { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.dim { color: var(--text-dim); }
+.faint { color: var(--text-faint); }
+.label { font-size: 11px; color: var(--text-dim); text-transform: uppercase; letter-spacing: .04em; }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: var(--surface-3); border: 2px solid var(--bg); border-radius: 6px; }
+::-webkit-scrollbar-track { background: transparent; }

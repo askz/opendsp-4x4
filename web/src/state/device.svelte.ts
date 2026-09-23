@@ -1,25 +1,30 @@
-// Reactive device model + controller. The UI mutates the model (instant feedback)
-// and each change is sent through the Connection's request channel, where queued
-// writes to the same parameter coalesce, so no UI-side debouncing is needed.
-// Engineering-unit params are converted to wire values via the Calibration seam.
+// Reactive facade for the UI: connection status, the editable device model (through
+// the Editor, which handles undo, links and delivery tracking), presets, meters and
+// the issue log.
 import { Connection, type ConnectionPhase, type SyncReason } from "./connection.ts";
+import { Editor, createEditorState, type EditorState, type SyncEntry } from "./editor.ts";
+import { modelFromReadback } from "./hydrate.ts";
+import { paramKey, describeParam, type ParamRef, type ParamValue } from "./params.ts";
+import { parsePresetFile, presetFileName, serializePresetFile, PresetFileError } from "./presetFile.ts";
+import { CHANNEL_COUNT, DEFAULT_BAND_FREQS, defaultBand, defaultModel, type Channel, type Compressor, type Gate } from "./model.ts";
 import { platformLinkProvider } from "../transport/platform.ts";
 import { ProtocolError, emptyStats, type ChannelStats } from "../transport/channel.ts";
 import type { Dsp, DeviceInfo } from "../dsp.ts";
-import { defaultCalibration, type Calibration } from "../eq/calibration.ts";
-import { gainRawToDb } from "../protocol/control.ts";
-import { thresholdRawToDb, samplesToMs, rawToQ, peqIndexToHz } from "../protocol/blocks.ts";
-import type { PresetReadback } from "../protocol/readback.ts";
-import { makeChannels, OUT_BASE, DEFAULT_BAND_FREQS, type Channel } from "./model.ts";
-import type { ChannelEq } from "../eq/types.ts";
+import { defaultCalibration } from "../eq/calibration.ts";
+import type { Crossover, PeqBand } from "../eq/types.ts";
 
-const DEFAULTS_KEY = "opendsp-defaults";
 const METER_INTERVAL_MS = 100;
 const MAX_ISSUES = 50;
+const MAX_FILE_ISSUES_LOGGED = 5;
 
 export interface Issue {
   at: number;
   message: string;
+}
+
+export interface ExportedFile {
+  name: string;
+  text: string;
 }
 
 const messageOf = (error: unknown) => (error instanceof Error ? error.message : String(error));
@@ -31,24 +36,27 @@ export class DeviceStore {
   info = $state<DeviceInfo | null>(null);
   productName = $state("");
   stats = $state<ChannelStats>(emptyStats());
-  /** Label of the long-running device operation in progress (recall/store), or "". */
+  /** Label of the long-running operation in progress (recall/store/import), or "". */
   busy = $state("");
   issues = $state<Issue[]>([]);
 
-  presetName = $state("");
   presetNames = $state<string[]>([]);
   activePreset = $state(-1);
-  hasDefaults = $state(typeof localStorage !== "undefined" && localStorage.getItem(DEFAULTS_KEY) !== null);
-  channels = $state<Channel[]>(makeChannels());
-  routing = $state<number[]>([0x01, 0x02, 0x04, 0x08]); // Out1..4 input masks (default diagonal)
-  selected = $state(-1); // selected channel index; -1 = nothing open (collapsed overview on load)
-  eqLink = $state<Record<number, number>>({}); // output index -> linked partner (symmetric); EQ edits mirror
+  edit = $state<EditorState>(createEditorState(defaultModel()));
+  meters = $state<number[]>(new Array(CHANNEL_COUNT).fill(0));
+  selected = $state(-1); // selected channel index; -1 = nothing open
 
   readonly connection: Connection;
-  private readonly cal: Calibration = defaultCalibration;
+  readonly editor: Editor;
+  private readonly cal = defaultCalibration;
   private meterRun = 0;
 
   constructor() {
+    this.editor = new Editor(this.edit, {
+      dsp: () => this.connection.dsp,
+      cal: this.cal,
+      onError: (label, error) => this.report(label, error),
+    });
     this.connection = new Connection(platformLinkProvider(), {
       sync: (dsp, reason) => this.hydrate(dsp, reason),
       started: (dsp) => this.startMeters(dsp),
@@ -64,18 +72,121 @@ export class DeviceStore {
     this.phase = this.connection.snapshot.phase;
   }
 
+  // --- read access ---
+
   get connected(): boolean { return this.phase === "ready"; }
   get supported(): boolean { return this.phase !== "unsupported"; }
+  get channels(): Channel[] { return this.edit.model.channels; }
+  get routing(): number[] { return this.edit.model.routing; }
+  get presetName(): string { return this.edit.model.presetName; }
+  get eqLink(): Record<number, number> { return this.edit.links; }
+  get modified(): boolean { return this.edit.modified; }
+  get undoLabel(): string | null { return this.edit.undoLabel; }
+  get redoLabel(): string | null { return this.edit.redoLabel; }
   get lastIssue(): Issue | undefined { return this.issues[this.issues.length - 1]; }
   get selectedChannel(): Channel | undefined { return this.channels[this.selected]; }
-  ch(index: number): Channel { return this.channels[index]!; }
-  /** Collapse the open node → all-collapsed patch-board overview. */
+  /** Parameters the device has not confirmed, by status. */
+  get unsynced(): { pending: number; failed: number; offline: number } {
+    const counts = { pending: 0, failed: 0, offline: 0 };
+    for (const entry of Object.values(this.edit.sync)) counts[entry.status]++;
+    return counts;
+  }
+  ch(index: number): Channel { return this.edit.model.channels[index]!; }
+  syncOf(ref: ParamRef): SyncEntry | undefined { return this.edit.sync[paramKey(ref)]; }
   collapse(): void { this.selected = -1; }
+
+  // --- connection ---
 
   connect(): Promise<void> { return this.connection.connect(); }
   autoConnect(): Promise<void> { return this.connection.autoConnect(); }
   disconnect(): Promise<void> { return this.connection.disconnect(); }
   clearIssues(): void { this.issues = []; }
+
+  // --- edits (all go through the Editor) ---
+
+  setGainDb(ch: number, db: number): void { this.change({ kind: "gain", ch }, db); }
+  setMute(ch: number, on: boolean): void { this.change({ kind: "mute", ch }, on); }
+  setPolarity(ch: number, invert: boolean): void { this.change({ kind: "polarity", ch }, invert); }
+  setDelayMs(ch: number, ms: number): void { this.change({ kind: "delay", ch }, ms); }
+  setRouting(outCh: number, mask: number): void { this.change({ kind: "routing", ch: outCh }, mask); }
+  setBand(ch: number, band: number, value: PeqBand): void { this.change({ kind: "peq", ch, band }, value); }
+  setHpf(ch: number, value: Crossover): void { this.change({ kind: "hpf", ch }, value); }
+  setLpf(ch: number, value: Crossover): void { this.change({ kind: "lpf", ch }, value); }
+  setComp(ch: number, value: Compressor): void { this.change({ kind: "comp", ch }, value); }
+  setGate(ch: number, value: Gate): void { this.change({ kind: "gate", ch }, value); }
+
+  /** Reset one PEQ band to its default (centre freq, 0 dB, 1 oct, peak, active). */
+  resetBand(ch: number, band: number): void {
+    this.change({ kind: "peq", ch, band }, defaultBand(DEFAULT_BAND_FREQS[band] ?? 1000), false);
+  }
+
+  copyEqTo(src: number, dst: number): void { this.guard("Copy EQ", () => this.editor.copyEq(src, dst)); }
+  linkEq(a: number, b: number): void { this.guard("Link EQ", () => this.editor.link(a, b)); }
+  unlinkEq(ch: number): void { this.editor.unlink(ch); }
+  undo(): void { void this.editor.undo(); }
+  redo(): void { void this.editor.redo(); }
+  /** End a gesture (pointer up) so the next edit is a separate undo step. */
+  seal(): void { this.editor.seal(); }
+  resendUnsynced(): void { void this.editor.resendUnsynced(); }
+
+  private change(ref: ParamRef, value: ParamValue, merge = true): void {
+    this.guard(describeParam(ref, this.edit.model), () => this.editor.set(ref, value, { merge }));
+  }
+
+  private guard(label: string, op: () => Promise<boolean>): void {
+    try {
+      void op();
+    } catch (error) {
+      this.report(label, error);
+    }
+  }
+
+  // --- presets ---
+
+  /** Recall a preset slot, then re-read the device so the UI shows what is actually loaded. */
+  recallPreset(slot: number): Promise<void> {
+    return this.runBusy(`Recall preset ${slot + 1}`, async (dsp) => {
+      await dsp.recallPreset(slot);
+      await this.connection.resync();
+    });
+  }
+
+  /** Store the live state into a preset slot, then refresh that slot's name and the active slot. */
+  storePreset(slot: number): Promise<void> {
+    return this.runBusy(`Store preset ${slot + 1}`, async (dsp) => {
+      await dsp.storePreset(slot);
+      const name = await dsp.presetName(slot);
+      this.presetNames = this.presetNames.map((existing, i) => (i === slot ? name : existing));
+      this.activePreset = await dsp.activePreset();
+      this.editor.markStored();
+    });
+  }
+
+  exportPresetFile(): ExportedFile {
+    const savedAt = new Date();
+    return { name: presetFileName(this.presetName, savedAt), text: serializePresetFile(this.edit.model, savedAt) };
+  }
+
+  /** Validate a preset file and apply it as one undoable edit (only differing values are sent). */
+  async importPresetFile(text: string): Promise<void> {
+    if (this.busy) return;
+    this.busy = "Import preset file";
+    try {
+      const parsed = parsePresetFile(text);
+      const delivered = await this.editor.setMany(`Import ${parsed.presetName || "preset file"}`, parsed.assignments);
+      if (!delivered && this.connected) this.report("Import preset file", new Error("some parameters were not confirmed by the device"));
+    } catch (error) {
+      this.report("Import preset file", error);
+      if (error instanceof PresetFileError) {
+        for (const issue of error.issues.slice(0, MAX_FILE_ISSUES_LOGGED)) this.report("Import preset file", new Error(issue));
+      }
+    } finally {
+      this.busy = "";
+    }
+  }
+
+  testTone(source: number, freqIndex = 0): void { this.send("Test tone", (d) => d.testTone(source, freqIndex)); }
+  setPassword(pw: string): void { this.send("Lock password", (d) => d.setPassword(pw)); }
 
   // --- readback ---
 
@@ -83,48 +194,9 @@ export class DeviceStore {
     const image = await dsp.presetImage();
     const activePreset = await dsp.activePreset();
     const presetNames = reason === "connect" ? await dsp.presetNames() : this.presetNames;
-    this.applyImage(image);
+    this.editor.load(modelFromReadback(image, this.cal, reason === "resync" ? this.edit.model : undefined));
     this.activePreset = activePreset;
     this.presetNames = presetNames;
-  }
-
-  /** Mirror a decoded preset image into the model. Mute and PEQ bypass have no readback. */
-  private applyImage(image: PresetReadback): void {
-    this.presetName = image.presetName;
-    image.inputs.forEach((record, i) => {
-      const ch = this.ch(i);
-      if (record.name) ch.name = record.name;
-      ch.gainDb = gainRawToDb(record.gainRaw);
-      ch.polarity = record.polarity;
-      ch.gate = {
-        attackMs: record.gate.atkRaw, releaseMs: record.gate.relRaw, holdMs: record.gate.holdRaw,
-        thresholdDb: thresholdRawToDb(record.gate.thrRaw),
-      };
-    });
-    image.outputs.forEach((record, i) => {
-      const ch = this.ch(OUT_BASE + i);
-      if (record.name) ch.name = record.name;
-      ch.gainDb = gainRawToDb(record.gainRaw);
-      ch.polarity = record.polarity;
-      ch.delayMs = samplesToMs(record.delaySamples);
-      this.routing[i] = record.routingMask;
-      ch.comp = {
-        ratioIndex: record.comp.ratioIndex, kneeDb: record.comp.kneeRaw,
-        attackMs: record.comp.atkRaw, releaseMs: record.comp.relRaw, thresholdDb: thresholdRawToDb(record.comp.thrRaw),
-      };
-      if (ch.eq) {
-        ch.eq.hpf = { freqHz: this.cal.xoverRawToHz(record.hpfRaw), slope: record.hpfSlope };
-        ch.eq.lpf = { freqHz: this.cal.xoverRawToHz(record.lpfRaw), slope: record.lpfSlope };
-        ch.eq.bands = record.bands.map((band) => {
-          const freqHz = peqIndexToHz(band.freqIdx);
-          return {
-            freqHz, type: band.type, bypass: false,
-            gainDb: this.cal.peqGainRawToDb(band.gainRaw, band.type),
-            bwOct: this.cal.qToBwOct(rawToQ(band.qRaw), freqHz),
-          };
-        });
-      }
-    });
   }
 
   // --- meters ---
@@ -136,7 +208,7 @@ export class DeviceStore {
 
   private stopMeters(): void {
     this.meterRun++;
-    for (const ch of this.channels) ch.meter = 0;
+    this.meters = new Array(CHANNEL_COUNT).fill(0);
   }
 
   /** Poll the 8 I/O levels at ~10 Hz on the background lane (user writes always go first). */
@@ -145,7 +217,7 @@ export class DeviceStore {
       const started = performance.now();
       try {
         const levels = await dsp.levels();
-        if (levels && run === this.meterRun) levels.forEach((level, i) => { this.ch(i).meter = level; });
+        if (levels && run === this.meterRun) this.meters = levels;
       } catch {
         // failures are counted by the Connection's transaction monitor
       }
@@ -153,7 +225,7 @@ export class DeviceStore {
     }
   }
 
-  // --- issue log ---
+  // --- issue log / helpers ---
 
   private report(label: string, error: unknown): void {
     if (error instanceof ProtocolError && error.kind === "closed") return; // the Connection reports the loss
@@ -161,7 +233,7 @@ export class DeviceStore {
     this.issues = [...this.issues.slice(-(MAX_ISSUES - 1)), issue];
   }
 
-  /** Fire-and-forget a device write; failures land in the issue log. */
+  /** Fire-and-forget a non-parameter command; failures land in the issue log. */
   private send(label: string, op: (dsp: Dsp) => Promise<unknown>): void {
     const dsp = this.connection.dsp;
     if (!dsp) return;
@@ -179,151 +251,6 @@ export class DeviceStore {
     } finally {
       this.busy = "";
     }
-  }
-
-  // --- channel basics ---
-  setGainDb(i: number, db: number): void { this.ch(i).gainDb = db; this.send(`${this.ch(i).name} gain`, (d) => d.setLevelDb(i, db)); }
-  setMute(i: number, on: boolean): void { this.ch(i).mute = on; this.send(`${this.ch(i).name} mute`, (d) => d.mute(i, on)); }
-  setPolarity(i: number, inv: boolean): void { this.ch(i).polarity = inv; this.send(`${this.ch(i).name} polarity`, (d) => d.setPolarity(i, inv)); }
-
-  // --- EQ (commit reads the already-mutated band; UI mutates eq directly for instant draw) ---
-  commitPeqBand(i: number, band: number): void {
-    this.sendPeqBand(i, band);
-    const p = this.eqLink[i];
-    if (p !== undefined && this.ch(p).eq) {
-      Object.assign(this.ch(p).eq!.bands[band]!, $state.snapshot(this.ch(i).eq!.bands[band]!));
-      this.sendPeqBand(p, band);
-    }
-  }
-  private sendPeqBand(i: number, band: number): void {
-    const b = this.ch(i).eq!.bands[band]!;
-    const params = {
-      freqHz: b.freqHz, q: this.cal.bwOctToQ(b.bwOct, b.freqHz),
-      gainRaw: this.cal.peqGainDbToRaw(b.gainDb, b.type), type: b.type, bypass: b.bypass,
-    };
-    this.send(`${this.ch(i).name} PEQ band ${band + 1}`, (d) => d.peqBand(i, band, params));
-  }
-  commitHpf(i: number): void { this.sendHpf(i); const p = this.eqLink[i]; if (p !== undefined && this.ch(p).eq) { this.ch(p).eq!.hpf = { ...$state.snapshot(this.ch(i).eq!.hpf) }; this.sendHpf(p); } }
-  commitLpf(i: number): void { this.sendLpf(i); const p = this.eqLink[i]; if (p !== undefined && this.ch(p).eq) { this.ch(p).eq!.lpf = { ...$state.snapshot(this.ch(i).eq!.lpf) }; this.sendLpf(p); } }
-  private sendHpf(i: number): void {
-    const { freqHz, slope } = this.ch(i).eq!.hpf;
-    const raw = this.cal.xoverHzToRaw(freqHz);
-    this.send(`${this.ch(i).name} high-pass`, (d) => d.crossoverHpf(i, raw, slope));
-  }
-  private sendLpf(i: number): void {
-    const { freqHz, slope } = this.ch(i).eq!.lpf;
-    const raw = this.cal.xoverHzToRaw(freqHz);
-    this.send(`${this.ch(i).name} low-pass`, (d) => d.crossoverLpf(i, raw, slope));
-  }
-
-  /** Reset one PEQ band to its default (centre freq, 0 dB, 1 oct, peak). */
-  resetBand(i: number, band: number): void {
-    const b = this.ch(i).eq!.bands[band]!;
-    b.freqHz = DEFAULT_BAND_FREQS[band] ?? 1000; b.gainDb = 0; b.bwOct = 1; b.type = 0; b.bypass = false;
-    this.commitPeqBand(i, band);
-  }
-  /** Copy a whole channel's EQ (7 bands + crossover) to another output and push it. */
-  copyEqTo(src: number, dst: number): void {
-    const s = this.ch(src).eq; if (!s || !this.ch(dst).eq) return;
-    this.ch(dst).eq = structuredClone($state.snapshot(s)) as ChannelEq;
-    this.pushEq(dst);
-  }
-  private pushEq(i: number): void {
-    const eq = this.ch(i).eq; if (!eq) return;
-    for (let b = 0; b < eq.bands.length; b++) this.sendPeqBand(i, b);
-    this.sendHpf(i); this.sendLpf(i);
-  }
-  /** Link two outputs' EQ so edits to either mirror to the other (and sync b←a now). */
-  linkEq(a: number, b: number): void {
-    this.eqLink = { ...this.eqLink, [a]: b, [b]: a };
-    this.copyEqTo(a, b);
-  }
-  unlinkEq(a: number): void {
-    const b = this.eqLink[a]; const next = { ...this.eqLink };
-    delete next[a]; if (b !== undefined) delete next[b];
-    this.eqLink = next;
-  }
-
-  // --- dynamics / delay / routing ---
-  setDelayMs(i: number, ms: number): void { this.ch(i).delayMs = ms; this.send(`${this.ch(i).name} delay`, (d) => d.delayMs(i, ms)); }
-  commitComp(i: number): void { const c = { ...this.ch(i).comp! }; this.send(`${this.ch(i).name} compressor`, (d) => d.compressor(i, c)); }
-  commitGate(i: number): void { const g = { ...this.ch(i).gate! }; this.send(`${this.ch(i).name} gate`, (d) => d.gate(i, g)); }
-  setRouting(outIndex: number, mask: number): void {
-    this.routing[outIndex - OUT_BASE] = mask;
-    this.send(`${this.ch(outIndex).name} routing`, (d) => d.routing(outIndex, mask));
-  }
-
-  // --- presets / global ---
-
-  /** Recall a preset slot, then re-read the device so the UI shows what is actually loaded. */
-  recallPreset(slot: number): Promise<void> {
-    return this.runBusy(`Recall preset ${slot + 1}`, async (dsp) => {
-      await dsp.recallPreset(slot);
-      await this.connection.resync();
-    });
-  }
-
-  /** Store the live state into a preset slot, then refresh that slot's name and the active slot. */
-  storePreset(slot: number): Promise<void> {
-    return this.runBusy(`Store preset ${slot + 1}`, async (dsp) => {
-      await dsp.storePreset(slot);
-      const name = await dsp.presetName(slot);
-      this.presetNames = this.presetNames.map((existing, i) => (i === slot ? name : existing));
-      this.activePreset = await dsp.activePreset();
-    });
-  }
-
-  testTone(source: number, freqIndex = 0): void { this.send("Test tone", (d) => d.testTone(source, freqIndex)); }
-  setPassword(pw: string): void { this.send("Lock password", (d) => d.setPassword(pw)); }
-
-  // --- defaults snapshot (browser localStorage; not a device preset slot) ---
-  saveDefaults(): void {
-    try {
-      localStorage.setItem(DEFAULTS_KEY, JSON.stringify({ channels: this.channels, routing: this.routing }));
-      this.hasDefaults = true;
-    } catch (error) {
-      this.report("Save defaults", error);
-    }
-  }
-  async restoreDefaults(): Promise<void> {
-    let snapshot: { channels: Channel[]; routing: number[] };
-    try {
-      snapshot = JSON.parse(localStorage.getItem(DEFAULTS_KEY) ?? "null");
-      if (!Array.isArray(snapshot?.channels) || snapshot.channels.length !== 8
-        || !Array.isArray(snapshot.routing) || snapshot.routing.length !== 4) throw new Error("saved snapshot is malformed");
-    } catch (error) {
-      this.report("Restore defaults", error);
-      return;
-    }
-    this.channels = snapshot.channels.map((ch) => ({ ...ch, meter: 0 }));
-    this.routing = snapshot.routing;
-    await this.pushAll();
-  }
-  /** Re-send every channel's full state to the device (Restore Defaults). */
-  async pushAll(): Promise<void> {
-    await this.runBusy("Restore defaults", async (dsp) => {
-      for (let i = 0; i < this.channels.length; i++) {
-        const ch = this.channels[i]!;
-        await dsp.setLevelDb(i, ch.gainDb);
-        await dsp.setPolarity(i, ch.polarity);
-        await dsp.mute(i, ch.mute);
-        if (ch.gate) await dsp.gate(i, ch.gate);
-        if (!ch.isOutput) continue;
-        if (ch.delayMs != null) await dsp.delayMs(i, ch.delayMs);
-        if (ch.comp) await dsp.compressor(i, ch.comp);
-        await dsp.routing(i, this.routing[i - OUT_BASE] ?? 0);
-        if (!ch.eq) continue;
-        await dsp.crossoverHpf(i, this.cal.xoverHzToRaw(ch.eq.hpf.freqHz), ch.eq.hpf.slope);
-        await dsp.crossoverLpf(i, this.cal.xoverHzToRaw(ch.eq.lpf.freqHz), ch.eq.lpf.slope);
-        for (let band = 0; band < ch.eq.bands.length; band++) {
-          const b = ch.eq.bands[band]!;
-          await dsp.peqBand(i, band, {
-            freqHz: b.freqHz, q: this.cal.bwOctToQ(b.bwOct, b.freqHz),
-            gainRaw: this.cal.peqGainDbToRaw(b.gainDb, b.type), type: b.type, bypass: b.bypass,
-          });
-        }
-      }
-    });
   }
 }
 

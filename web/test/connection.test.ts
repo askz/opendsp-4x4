@@ -5,7 +5,7 @@ import type { LinkProvider } from "../src/transport/platform.ts";
 import type { HidLink } from "../src/transport/link.ts";
 import type { Dsp } from "../src/dsp.ts";
 import { Command } from "../src/protocol/commands.ts";
-import { MockDsp } from "./support/mock-dsp.ts";
+import { MockDsp } from "../src/transport/mock.ts";
 
 class FakeProvider implements LinkProvider {
   nextPick: HidLink | null = null;

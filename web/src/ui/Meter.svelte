@@ -1,0 +1,57 @@
+<script lang="ts">
+  // Level meter for a 0..1 reading (linear in dB between the device's floor and full
+  // scale), with a short peak hold.
+  import { untrack } from "svelte";
+
+  interface Props {
+    level: number;
+    orientation?: "vertical" | "horizontal";
+    title?: string;
+  }
+
+  let { level, orientation = "vertical", title }: Props = $props();
+
+  const PEAK_HOLD_MS = 1200;
+  const PEAK_FALL_PER_UPDATE = 0.04;
+
+  let peak = $state(0);
+  let peakAt = 0;
+
+  const clamped = $derived(Math.max(0, Math.min(1, level)));
+  const percent = $derived(clamped * 100);
+  const zone = $derived(clamped > 0.9 ? "hi" : clamped > 0.7 ? "mid" : "lo");
+
+  $effect(() => {
+    const current = clamped;
+    const now = performance.now();
+    const held = untrack(() => peak);
+    if (current >= held) {
+      peak = current;
+      peakAt = now;
+    } else if (now - peakAt > PEAK_HOLD_MS) {
+      peak = Math.max(current, held - PEAK_FALL_PER_UPDATE);
+    }
+  });
+</script>
+
+<div class="meter {orientation}" role="meter" aria-valuemin={0} aria-valuemax={1} aria-valuenow={clamped} {title}>
+  <div class="fill {zone}" style={orientation === "vertical" ? `height:${percent}%` : `width:${percent}%`}></div>
+  {#if peak > 0.02}
+    <div class="peak" style={orientation === "vertical" ? `bottom:${peak * 100}%` : `left:${peak * 100}%`}></div>
+  {/if}
+</div>
+
+<style>
+  .meter { position: relative; background: #0b0d0f; border: 1px solid var(--line); overflow: hidden; }
+  .vertical { width: 8px; height: 100%; min-height: 24px; }
+  .horizontal { height: 6px; width: 100%; }
+  .fill { position: absolute; left: 0; bottom: 0; }
+  .vertical .fill { right: 0; }
+  .horizontal .fill { top: 0; }
+  .lo { background: var(--meter-lo); }
+  .mid { background: var(--meter-mid); }
+  .hi { background: var(--meter-hi); }
+  .peak { position: absolute; background: var(--text); }
+  .vertical .peak { left: 0; right: 0; height: 1px; }
+  .horizontal .peak { top: 0; bottom: 0; width: 1px; }
+</style>

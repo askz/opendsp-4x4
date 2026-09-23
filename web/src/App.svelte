@@ -1,88 +1,72 @@
 <script lang="ts">
   import { device } from "./state/device.svelte.ts";
-  import PatchBoard from "./components/PatchBoard.svelte";
-  import PresetPads from "./components/PresetPads.svelte";
-  import TestTonePanel from "./components/TestTonePanel.svelte";
-  import LockDialog from "./components/LockDialog.svelte";
+  import { ui } from "./state/ui.svelte.ts";
+  import TopBar from "./shell/TopBar.svelte";
+  import ChannelTabs from "./shell/ChannelTabs.svelte";
+  import StatusBar from "./shell/StatusBar.svelte";
+  import Overview from "./views/Overview.svelte";
+  import InputView from "./views/InputView.svelte";
+  import OutputView from "./views/OutputView.svelte";
+  import SystemView from "./views/SystemView.svelte";
+  import { OUT_BASE } from "./state/model.ts";
 
-  const PHASE_LABEL = {
-    unsupported: "Unsupported browser", idle: "Not connected", connecting: "Connecting…",
-    syncing: "Reading device…", ready: "Connected", lost: "Connection lost",
-  } as const;
-  const status = $derived(
-    device.busy ? `${device.busy}…`
-      : device.connected ? device.info?.firmware || device.info?.version || device.productName
-      : device.connectionError || PHASE_LABEL[device.phase],
-  );
-  const working = $derived(device.phase === "connecting" || device.phase === "syncing");
-  let showSystem = $state(false);
+  const SYSTEM_KEY = "9";
+
+  function isEditable(target: EventTarget | null): boolean {
+    return target instanceof HTMLElement && (target.isContentEditable || ["INPUT", "SELECT", "TEXTAREA"].includes(target.tagName));
+  }
+
+  /** Ctrl/⌘+Z undo, Ctrl/⌘+Shift+Z or Ctrl+Y redo, 0 overview, 1–8 channels, 9 system. */
+  function onKeydown(event: KeyboardEvent): void {
+    const mod = event.ctrlKey || event.metaKey;
+    if (mod && !event.altKey && event.key.toLowerCase() === "z") {
+      if (isEditable(event.target) && (event.target as HTMLElement).tagName !== "SELECT") return; // native text undo
+      event.preventDefault();
+      if (event.shiftKey) device.redo();
+      else device.undo();
+      return;
+    }
+    if (mod && event.key.toLowerCase() === "y") {
+      event.preventDefault();
+      device.redo();
+      return;
+    }
+    if (mod || event.altKey || isEditable(event.target) || document.querySelector("dialog[open]")) return;
+    if (event.key === "0") ui.open("overview");
+    else if (event.key === SYSTEM_KEY) ui.open("system");
+    else if (/^[1-8]$/.test(event.key)) ui.open(Number(event.key) - 1);
+  }
 </script>
 
-<header class="top">
-  <strong>openDSP-4x4</strong><span class="muted"> · t.racks DSP 4x4 Mini Pro</span>
-  <span class="spacer"></span>
-  {#if device.lastIssue}
-    <button class="issue" title={device.issues.map((i) => i.message).join("\n")} onclick={() => device.clearIssues()}>
-      {device.issues.length} issue{device.issues.length === 1 ? "" : "s"}: {device.lastIssue.message}
-    </button>
+<svelte:window onkeydown={onKeydown} />
+
+<TopBar />
+<ChannelTabs />
+
+<main>
+  {#if !device.supported}
+    <div class="notice bad">This browser cannot reach USB devices. Use Chrome or Edge on a desktop computer, or the Android app.</div>
+  {:else if device.phase === "lost"}
+    <div class="notice bad">{device.connectionError}. Plug the DSP back in to reconnect automatically, or press Connect.</div>
+  {:else if !device.connected && device.phase !== "syncing"}
+    <div class="notice">Offline: edits change this screen only. Connecting loads the device's current settings.</div>
   {/if}
-  <span class="dot" class:ok={device.connected} class:busy={working}></span>
-  <span class="status" class:ok={device.connected} title={status}>{status}</span>
-  {#if device.connected}
-    <button onclick={() => device.disconnect()}>Disconnect</button>
+
+  {#if ui.view === "overview"}
+    <Overview />
+  {:else if ui.view === "system"}
+    <SystemView />
+  {:else if ui.view < OUT_BASE}
+    {#key ui.view}<InputView ch={ui.view} />{/key}
   {:else}
-    <button class="primary" disabled={!device.supported || working} onclick={() => device.connect()}>Connect DSP…</button>
+    {#key ui.view}<OutputView ch={ui.view} />{/key}
   {/if}
-</header>
+</main>
 
-<PresetPads />
-
-{#if !device.supported}<div class="warn-box">WebHID isn't available — use <b>Chrome</b> or <b>Edge</b> on desktop.</div>{/if}
-
-<PatchBoard />
-
-<!-- Fixed bottom bar: System expander, then the tagline at the very bottom. The
-     tagline (not the tappable toggle) sits over the Android nav/gesture area. -->
-<div class="bottombar">
-  {#if showSystem}<div class="system">
-    <TestTonePanel /><div class="vline"></div><LockDialog /><div class="vline"></div>
-    <div class="defaults">
-      <strong class="hd">Defaults <span class="muted">(this browser)</span></strong>
-      <div class="drow">
-        <button onclick={() => device.saveDefaults()} disabled={!device.connected}>Save current</button>
-        <button class="primary" onclick={() => device.restoreDefaults()} disabled={!device.connected || !device.hasDefaults}>Restore</button>
-      </div>
-      <span class="muted">{device.hasDefaults ? "snapshot saved — Restore re-sends it to the DSP" : "no snapshot yet — Save the current setup first"}</span>
-    </div>
-  </div>{/if}
-  <button class="systoggle" class:on={showSystem} onclick={() => (showSystem = !showSystem)}>System {showSystem ? "▾" : "▴"}</button>
-  <footer class="agpl muted">
-    openDSP-4x4 · <a href="https://www.gnu.org/licenses/agpl-3.0.html">AGPL-3.0</a> ·
-    <a href="https://github.com/GlassOnTin/opendsp-4x4">source</a> ·
-    <a href="https://ko-fi.com/glassontin">Ko-fi ☕</a> · not affiliated with Thomann
-  </footer>
-</div>
+<StatusBar />
 
 <style>
-  .top { display: flex; align-items: center; gap: .55rem; padding: calc(.6rem + var(--safe-top, 0px)) 1rem .6rem; border-bottom: 1px solid var(--line); background: var(--bg-panel); }
-  .spacer { flex: 1; }
-  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--bad); box-shadow: 0 0 8px var(--bad); }
-  .dot.ok { background: var(--good); box-shadow: 0 0 8px var(--good); }
-  .dot.busy { background: var(--warn); box-shadow: 0 0 8px var(--warn); }
-  .issue { max-width: 36ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: .78rem; color: var(--warn); border-color: var(--warn); }
-  .status { font-size: .82rem; color: var(--text-dim); max-width: 22ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .status.ok { color: var(--good); }
-  button.on { border-color: var(--accent); }
-  .warn-box { margin: .6rem 1rem; background: #4a2b00; color: #ffd9a0; padding: .55rem .8rem; border-radius: var(--radius); }
-  .bottombar { position: fixed; left: 0; right: 0; bottom: 0; z-index: 20; display: flex; flex-direction: column; background: var(--bg-panel); border-top: 1px solid var(--line); padding-bottom: var(--safe-bottom, 0px); }
-  .systoggle { width: 100%; border: none; border-radius: 0; padding: .55rem; background: var(--bg-panel); color: var(--text-dim); font: inherit; }
-  .systoggle.on { color: var(--accent); }
-  :global(body) { padding-bottom: calc(4.2rem + var(--safe-bottom, 0px)); } /* clear toggle + tagline */
-  .system { display: flex; gap: 1rem; align-items: center; padding: .7rem .9rem; border-bottom: 1px solid var(--line); flex-wrap: wrap; max-height: 55vh; overflow: auto; }
-  .vline { width: 1px; align-self: stretch; background: var(--line); }
-  .defaults { display: flex; flex-direction: column; gap: .45rem; }
-  .defaults .hd { font-size: .82rem; color: var(--text-dim); }
-  .drow { display: flex; gap: .4rem; }
-  .agpl { padding: .5rem 1rem; border-top: 1px solid var(--line); font-size: .72rem; }
-  .agpl a { color: var(--accent); }
+  main { flex: 1; min-height: 0; overflow: auto; padding: var(--gap); display: grid; gap: var(--gap); align-content: start; }
+  .notice { max-width: 1100px; padding: 6px 10px; border: 1px solid var(--line-strong); border-left: 3px solid var(--warn); border-radius: var(--radius); background: var(--surface); color: var(--text-dim); }
+  .notice.bad { border-left-color: var(--bad); }
 </style>

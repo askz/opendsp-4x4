@@ -9,7 +9,8 @@ export interface PeqBand {
   gainDb: number;  // ~ -18 .. +18
   bwOct: number;   // bandwidth in octaves (editor unit; -> Q on the wire)
   type: number;    // PeqType code (0..6)
-  bypass: boolean;
+  /** null = unknown: the device has no bypass readback (drawn as active). */
+  bypass: boolean | null;
 }
 
 export interface Crossover {

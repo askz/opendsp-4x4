@@ -6,7 +6,7 @@ import { Command, ReplyCode, PRESET_SLOT_COUNT } from "../src/protocol/commands.
 import { expectedReplyCode, replyTimeoutMs, replyMatcher } from "../src/protocol/exchange.ts";
 import { readPresetNameFrame, getLevelsFrame } from "../src/protocol/control.ts";
 import { gainRawToDb } from "../src/protocol/control.ts";
-import { MockDsp } from "./support/mock-dsp.ts";
+import { MockDsp } from "../src/transport/mock.ts";
 
 async function connect(device = new MockDsp()): Promise<{ device: MockDsp; dsp: Dsp }> {
   await device.open();

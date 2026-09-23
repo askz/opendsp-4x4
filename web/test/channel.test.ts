@@ -4,7 +4,7 @@ import { RequestChannel, ProtocolError } from "../src/transport/channel.ts";
 import { Command, ReplyCode } from "../src/protocol/commands.ts";
 import { getVersionFrame, getLevelsFrame, readChannelFrame, levelDbFrame, muteFrame, recallPresetFrame } from "../src/protocol/control.ts";
 import { buildRequest } from "../src/protocol/frame.ts";
-import { MockDsp } from "./support/mock-dsp.ts";
+import { MockDsp } from "../src/transport/mock.ts";
 
 async function openChannel(device = new MockDsp()): Promise<{ device: MockDsp; channel: RequestChannel }> {
   await device.open();

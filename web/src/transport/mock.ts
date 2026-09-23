@@ -2,10 +2,11 @@
 // behaviour measured on hardware: queries echo their code (0x27 → 0x24), writes
 // are acked with 0x01, unknown opcodes get 0x02, bad checksums get no reply, and a
 // frame that arrives while the device is still processing the previous one is dropped.
-import type { HidLink } from "../../src/transport/link.ts";
-import { frameWrap, parseFrame } from "../../src/protocol/frame.ts";
-import { Command, ReplyCode, PRESET_SLOT_COUNT } from "../../src/protocol/commands.ts";
-import { defaultPresetPages } from "./default-preset.ts";
+// Used by the tests, and by dev builds opened with ?mock (UI work without hardware).
+import type { HidLink } from "./link.ts";
+import { frameWrap, parseFrame } from "../protocol/frame.ts";
+import { Command, ReplyCode, PRESET_SLOT_COUNT } from "../protocol/commands.ts";
+import { defaultPresetPages } from "./factory-pages.ts";
 
 const WRITE_CODES: ReadonlySet<number> = new Set([
   Command.INIT_DONE, Command.RECALL_PRESET, Command.STORE_PRESET, Command.SET_NAME, Command.SET_PASSWORD,

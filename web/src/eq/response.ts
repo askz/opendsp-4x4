@@ -12,7 +12,7 @@ export function logFreqAxis(n = 300, fMin = 20, fMax = 20000): Float64Array {
   return a;
 }
 
-const isFlat = (b: PeqBand) => b.bypass || b.type === PeqType.ALLPASS1 || b.type === PeqType.ALLPASS2;
+const isFlat = (b: PeqBand) => b.bypass === true || b.type === PeqType.ALLPASS1 || b.type === PeqType.ALLPASS2;
 
 /** Magnitude (dB) of one band across the axis (zeros if bypassed / allpass). */
 export function bandResponseDb(band: PeqBand, freqs: Float64Array, fs = FS): Float64Array {
